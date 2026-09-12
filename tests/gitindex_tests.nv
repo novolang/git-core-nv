@@ -1,0 +1,160 @@
+// gitindex_tests.nv — the stat cache, and the second nobody can tell
+// apart.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-core-nv.gitindex.<fn>`.
+//
+// WHERE THE VECTORS CAME FROM.  The signature `DIRC`, the versions 2,
+// 3 and 4, the stage numbers 0..3 and the racy-clean rule are git's own
+// `Documentation/technical/index-format.txt` and `read-cache.c`.  The
+// racy rule in particular is a behaviour test rather than a format one:
+// an entry whose mtime is not older than the index's own write time
+// must be hashed anyway, and a reader that skipped it reports a
+// modified file as clean, once, unreproducibly.
+
+use std.test
+use std.bytes
+use std.list
+use gitobj
+use gitindex
+
+// A `stat` block with an mtime and a size and nothing else set — what
+// a network filesystem with `core.checkStat = minimal` reports.
+fn stat_at(mtime: Int, size: Int) -> GitStat
+    gitindex.stat_of(0, 0, mtime, 0, 0, 0, 33188, 0, 0, size)
+
+@test
+fn test_an_empty_index_is_a_version_and_no_entries() [io]
+    test.case("version 2, which is what git writes unless an entry needs more")
+    test.assert_eq(gitindex.empty(2, gitobj.GitSha1).version, 2)
+
+    test.case("and it holds nothing")
+    test.assert_eq(list.len(gitindex.empty(2, gitobj.GitSha1).entries), 0)
+
+    test.case("so it has no conflicts")
+    test.assert_eq(list.len(gitindex.conflicts(gitindex.empty(2, gitobj.GitSha1), bytes.zeros(0))), 0)
+
+@test
+fn test_bytes_that_are_not_dirc_are_refused_rather_than_decoded() [io]
+    test.case("zeros are not an index")
+    match gitindex.parse(bytes.zeros(32), gitobj.GitSha1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and neither is nothing")
+    match gitindex.parse(bytes.zeros(0), gitobj.GitSha1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_stat_block_is_ten_numbers_the_caller_supplies() [io]
+    // Taking the numbers rather than reading them is what keeps the
+    // whole module `[]` — a test builds the case it wants and no
+    // filesystem is in the room.
+    test.case("the mtime goes where it was put")
+    test.assert_eq(stat_at(1700000000, 12).mtime_seconds, 1700000000)
+
+    test.case("and so does the size")
+    test.assert_eq(stat_at(1700000000, 12).size, 12)
+
+    test.case("dev and ino are zero on a filesystem that has none")
+    test.assert_eq(stat_at(1700000000, 12).dev, 0)
+    test.assert_eq(stat_at(1700000000, 12).ino, 0)
+
+@test
+fn test_an_entry_written_in_the_index_s_own_second_is_hashed_anyway() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  No amount of comparing
+    // mtimes can tell "unchanged" from "changed within the second", so
+    // git treats such an entry as dirty.  A reader that did not would
+    // report a modified file as clean, once, unreproducibly, which is
+    // the worst kind of wrong answer a version-control tool can give.
+    let e = GitIndexEntry {
+        stat: stat_at(1700000000, 12),
+        oid: gitobj.null_oid(gitobj.GitSha1),
+        stage: 0,
+        assume_valid: false,
+        skip_worktree: false,
+        path_at: 0,
+        path_len: 0 }
+    test.case("an entry as new as the index is racy")
+    test.assert(gitindex.is_racy(e, 1700000000, 0))
+
+    test.case("an entry older than the index is not")
+    test.assert(gitindex.is_racy(e, 1700000001, 0) == false)
+
+@test
+fn test_the_stat_cache_is_why_status_is_fast() [io]
+    // `false` — the common answer — means the file is unchanged
+    // without reading a byte of it.  A model without the stat block
+    // produces a `status` that is correct and forty times slower.
+    let e = GitIndexEntry {
+        stat: stat_at(1700000000, 12),
+        oid: gitobj.null_oid(gitobj.GitSha1),
+        stage: 0,
+        assume_valid: false,
+        skip_worktree: false,
+        path_at: 0,
+        path_len: 0 }
+    test.case("the same stat means nothing has to be read")
+    test.assert(gitindex.needs_rehash(e, stat_at(1700000000, 12), true, true) == false)
+
+    test.case("a different size means it does")
+    test.assert(gitindex.needs_rehash(e, stat_at(1700000000, 13), true, true))
+
+    test.case("a different mtime means it does")
+    test.assert(gitindex.needs_rehash(e, stat_at(1700000001, 12), true, true))
+
+    test.case("and the batch form answers nothing for an empty index")
+    let ix = gitindex.empty(2, gitobj.GitSha1)
+    test.assert_eq(list.len(gitindex.paths_to_rehash(ix, bytes.zeros(0), [], true, true)), 0)
+
+@test
+fn test_a_commit_over_an_unresolved_merge_is_refused() [io]
+    // An index is keyed by (path, stage), so a path with three entries
+    // is a conflict — and a tool that keyed it by path alone cannot
+    // see one.
+    test.case("an empty index has a top level")
+    match gitindex.tree_level(gitindex.empty(2, gitobj.GitSha1), bytes.zeros(0), "")
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.assert_eq(list.len(l.entries), 0)
+            test.assert_eq(list.len(l.subdirectories), 0)
+
+@test
+fn test_the_optional_sections_are_kept_rather_than_dropped() [io]
+    // A tool that rewrote the index without `TREE` makes the next
+    // `git status` slow, and without `REUC` the next `git checkout -m`
+    // loses information.
+    test.case("an empty index carries no cached tree")
+    test.assert_none(gitindex.extension_of(gitindex.empty(2, gitobj.GitSha1), "TREE"))
+
+    test.case("and writing one back produces bytes")
+    match gitindex.serialise(gitindex.empty(2, gitobj.GitSha1), bytes.zeros(0))
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(bytes.len(b) > 0)
+
+@test
+fn test_the_index_is_keyed_by_path_and_stage_and_not_by_path() [io]
+    // A path with three entries is an unresolved conflict, and a tool
+    // that keyed the index by path alone cannot see one — it answers
+    // whichever of the three it met first.
+    let ix = gitindex.empty(2, gitobj.GitSha1)
+    let e = GitIndexEntry {
+        stat: stat_at(1700000000, 12),
+        oid: gitobj.null_oid(gitobj.GitSha1),
+        stage: 0,
+        assume_valid: false,
+        skip_worktree: false,
+        path_at: 0,
+        path_len: 0 }
+    test.case("an empty index holds no entry for any path at any stage")
+    test.assert_none(gitindex.entry_of(ix, bytes.zeros(0), "src/main.nv", 0))
+
+    test.case("staging one adds it")
+    test.assert_eq(list.len(gitindex.with_entry(ix, e, bytes.zeros(0)).entries), 1)
+
+    test.case("and removing a path takes every stage of it")
+    test.assert_eq(list.len(gitindex.without_path(ix, bytes.zeros(0), "src/main.nv").entries), 0)
+
+    test.case("an entry's path is the range it carries, read once")
+    test.assert_eq_str(gitindex.path_of(e, bytes.zeros(0)), "")

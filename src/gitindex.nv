@@ -1,0 +1,397 @@
+// gitindex.nv — the index file, which is what `status` is actually
+// about.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE INDEX IS A CACHE, AND EVERY FIELD IN IT IS THERE TO AVOID READING
+// A FILE.  `git status` in a repository with a hundred thousand files
+// does not hash a hundred thousand files: it compares each entry's
+// stored `stat` data — size, mtime, inode, mode — against what the
+// filesystem says, and hashes only the ones that differ.  A package that
+// modelled the index as "a list of paths and ids" would produce a
+// `status` that is correct and forty times slower, which is the same as
+// producing one nobody uses.
+//
+// So `GitIndexEntry` carries the whole `stat` block, `is_racy` is
+// published, and `needs_rehash` is the comparison that decides.
+//
+// THE RACY-CLEAN PROBLEM IS REAL AND IS PUBLISHED.  A file written in
+// the same second the index was written has an mtime equal to the
+// index's own, and no amount of comparing mtimes can tell "unchanged"
+// from "changed within the second". Git's answer is to treat such an
+// entry as dirty and hash it; a reader that did not would report a
+// modified file as clean, once, unreproducibly, which is the worst kind
+// of wrong answer a version-control tool can give.
+//
+// STAGE NUMBERS ARE THE MERGE.  An entry's stage is 0 for an ordinary
+// file and 1, 2, 3 for the base, ours and theirs of an unresolved
+// conflict — so a path with three entries is a conflict, and a tool that
+// keyed the index by path alone cannot see one.  The index is keyed by
+// (path, stage), and `conflicts` is that fact as a query.
+//
+// EXTENSIONS ARE KEPT, NOT DROPPED.  `TREE` (the cached tree), `REUC`
+// (resolve undo) and the rest are optional, and a tool that rewrote the
+// index without them makes the next `git status` slow and the next
+// `git checkout -m` lose information.  They are kept as ranges.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]` —
+// reading the file is git-nv's `gitrepo`.
+
+// The `stat` data the index caches for one path.
+//
+// Seconds and nanoseconds separately, as the file stores them.  `dev`
+// and `ino` are zero on a filesystem that has none, which is what
+// `core.checkStat = minimal` means and what a checkout onto a network
+// filesystem produces — and a comparison that required them to match
+// reports every file modified.
+pub struct GitStat
+    ctime_seconds: Int
+    ctime_nanos: Int
+    mtime_seconds: Int
+    mtime_nanos: Int
+    dev: Int
+    ino: Int
+    mode: Int
+    uid: Int
+    gid: Int
+    size: Int
+
+// One path in the index.
+//
+// `path_at`/`path_len` are a range into the index bytes: a hundred
+// thousand entries is a hundred thousand paths, and a reader that made a
+// `Str` of each allocates the whole tree to answer one question.
+pub struct GitIndexEntry
+    stat: GitStat
+    oid: GitOid
+    // 0 ordinary, 1 base, 2 ours, 3 theirs.
+    stage: Int
+    // The `assume-valid` bit: git skips this entry's `stat` check
+    // entirely.  Carried because a user who set it and forgot is the
+    // explanation for "git does not see my change", and a tool that
+    // cannot report it cannot explain.
+    assume_valid: Bool
+    // The `skip-worktree` bit, which sparse checkout sets.  An entry
+    // with it is not expected to be on disk at all, and a `status` that
+    // did not know would report the whole repository deleted.
+    skip_worktree: Bool
+    path_at: Int
+    path_len: Int
+
+// A parsed index.
+//
+// `version` matters: 2 is the plain one, 3 adds the extended flags, and
+// 4 PREFIX-COMPRESSES the path names — so a version-4 index cannot be
+// read by a parser that assumes a path is a plain run of bytes, and a
+// parser that ignored the version produces garbage paths rather than a
+// refusal.
+pub struct GitIndex
+    version: Int
+    entries: [GitIndexEntry]
+    algo: GitHashAlgo
+    // The optional sections, as ranges, in the order they appeared.
+    extensions: [GitIndexExtension]
+
+// One index extension, kept verbatim.
+pub struct GitIndexExtension
+    // The four-character signature: `TREE`, `REUC`, `UNTR`, `link`,
+    // `FSMN`, `EOIE`, `IEOT`.
+    signature: Str
+    at: Int
+    len: Int
+
+// Why an index file did not parse.
+pub enum GitIndexFault
+    // The signature is not `DIRC`.
+    GitIndexBadSignature
+    // A version this reader does not know.  2, 3 and 4 are git's.
+    GitIndexBadVersion(found: Int)
+    // The file ends inside an entry.
+    GitIndexTruncated(at: Int)
+    // A stage outside 0..3.
+    GitIndexBadStage(at: Int, stage: Int)
+    // The trailing checksum does not match the content.  The one fault
+    // that means the file is damaged rather than unfamiliar.
+    GitIndexChecksumMismatch
+    // A version-4 prefix compression that refers back further than
+    // there is.
+    GitIndexBadPrefix(at: Int)
+    // An extension whose declared length runs past the file.
+    GitIndexBadExtension(at: Int, signature: Str)
+
+// The standard `Error` implementation.
+impl Error for GitIndexFault
+    // One line: what was wrong, and at what byte offset into the index.
+    fn message(self) -> Str
+        todo("git-core-nv.gitindex.GitIndexFault.message")
+
+// Parse an index file.
+//
+// Versions 2, 3 and 4, with version 4's prefix compression undone into
+// the ranges the entries carry — so a caller never sees the difference
+// and a version-4 repository is not a special case in every consumer.
+//
+// ```novo
+// use gitindex
+//
+// fn read(raw: Bytes) -> Result<GitIndex, GitIndexFault>
+//     gitindex.parse(raw, GitSha1)
+//
+// fn main() [io]
+//     println("the index, read")
+// ```
+pub fn parse(raw: Bytes, algo: GitHashAlgo) -> Result<GitIndex, GitIndexFault> []
+    todo("git-core-nv.gitindex.parse")
+
+// Write an index back.
+//
+// Always version 2 unless an entry needs 3, which is git's own rule and
+// the conservative one: a version-4 index is smaller and is unreadable
+// by older tools, and a package that silently upgraded a repository's
+// index format would break whatever else the user runs.  The trailing
+// checksum is computed here, so an index this writes is one git will
+// read.
+//
+// ```novo
+// use gitindex
+//
+// fn written(ix: GitIndex, paths: Bytes) -> Result<Bytes, GitIndexFault>
+//     gitindex.serialise(ix, paths)
+//
+// fn main() [io]
+//     println("the index, back to bytes")
+// ```
+pub fn serialise(ix: GitIndex, paths: Bytes) -> Result<Bytes, GitIndexFault> []
+    todo("git-core-nv.gitindex.serialise")
+
+// The entry for this path at this stage, or `None`.
+//
+// Both keys, because the index is keyed by both and a lookup by path
+// alone answers the wrong one of a conflict's three entries.
+//
+// ```novo
+// use gitindex
+//
+// fn at(ix: GitIndex, paths: Bytes) -> ?GitIndexEntry
+//     gitindex.entry_of(ix, paths, "src/main.nv", 0)
+//
+// fn main() [io]
+//     println("one path's index entry")
+// ```
+pub fn entry_of(ix: GitIndex, paths: Bytes, path: Str, stage: Int) -> ?GitIndexEntry []
+    todo("git-core-nv.gitindex.entry_of")
+
+// Every path with more than one stage: the unresolved conflicts.
+//
+// Answers the paths, because that is what a `status` prints and what a
+// tool refuses to commit over.  A merge in progress is exactly "this
+// list is not empty", and a tool that decided by looking for
+// `MERGE_HEAD` gets a rebase and a cherry-pick wrong.
+//
+// ```novo
+// use gitindex
+//
+// fn unresolved(ix: GitIndex, paths: Bytes) -> [Str]
+//     gitindex.conflicts(ix, paths)
+//
+// fn main() [io]
+//     println("the paths a merge left unresolved")
+// ```
+pub fn conflicts(ix: GitIndex, paths: Bytes) -> [Str] []
+    todo("git-core-nv.gitindex.conflicts")
+
+// Would this entry have to be hashed to know whether it changed?
+//
+// The whole of `status`'s speed, in one comparison.  `false` — the
+// common answer — means the `stat` the filesystem reports matches the
+// one the index cached, and the file is unchanged without reading a
+// byte of it.
+//
+// The fields compared are the ones git compares, which is not all of
+// them: `ctime` is compared only when `core.trustCtime` is on, and
+// `dev`/`ino`/`uid`/`gid` only when `core.checkStat` is `default` — so
+// the flags are parameters rather than assumptions, because a checkout
+// on a network filesystem has all four wrong and every file would
+// otherwise be reported modified.
+//
+// ```novo
+// use gitindex
+//
+// fn changed(e: GitIndexEntry, now: GitStat) -> Bool
+//     gitindex.needs_rehash(e, now, true, true)
+//
+// fn main() [io]
+//     println("whether a file has to be read to know it changed")
+// ```
+pub fn needs_rehash(e: GitIndexEntry, current: GitStat, trust_ctime: Bool,
+                    check_stat: Bool) -> Bool []
+    todo("git-core-nv.gitindex.needs_rehash")
+
+// Is this entry racy-clean against an index written at this instant?
+//
+// An entry whose mtime is not older than the index's own write time
+// cannot be distinguished from one modified in the same second, so git
+// treats it as dirty and hashes it.  Published rather than folded into
+// `needs_rehash`, because a tool that reports WHY it hashed a file —
+// and "it was written in the same second as the index" is a real answer
+// people need — cannot get that from a boolean.
+//
+// ```novo
+// use gitindex
+//
+// fn racy(e: GitIndexEntry, index_mtime: Int) -> Bool
+//     gitindex.is_racy(e, index_mtime, 0)
+//
+// fn main() [io]
+//     println("whether a file changed within the index's own second")
+// ```
+pub fn is_racy(e: GitIndexEntry, index_mtime_seconds: Int, index_mtime_nanos: Int) -> Bool []
+    todo("git-core-nv.gitindex.is_racy")
+
+// The index with this entry added or replaced at its stage.
+//
+// Kept in git's own order — by path, then by stage — because the file
+// format requires it and an index written out of order is one git
+// reads and `git fsck` refuses.
+//
+// ```novo
+// use gitindex
+//
+// fn staged(ix: GitIndex, e: GitIndexEntry, paths: Bytes) -> GitIndex
+//     gitindex.with_entry(ix, e, paths)
+//
+// fn main() [io]
+//     println("a path, staged")
+// ```
+pub fn with_entry(ix: GitIndex, e: GitIndexEntry, paths: Bytes) -> GitIndex []
+    todo("git-core-nv.gitindex.with_entry")
+
+// The index with every stage of this path removed.
+//
+// Every stage, because removing stage 0 from a conflicted path leaves
+// the conflict and removing one side of a conflict leaves an index git
+// cannot commit.
+//
+// ```novo
+// use gitindex
+//
+// fn dropped(ix: GitIndex, paths: Bytes) -> GitIndex
+//     gitindex.without_path(ix, paths, "src/old.nv")
+//
+// fn main() [io]
+//     println("a path, removed from the index")
+// ```
+pub fn without_path(ix: GitIndex, paths: Bytes, path: Str) -> GitIndex []
+    todo("git-core-nv.gitindex.without_path")
+
+// An empty index of this version.
+//
+// ```novo
+// use gitindex
+//
+// fn main() [io]
+//     println("${gitindex.empty(2, GitSha1).version}")
+// ```
+pub fn empty(version: Int, algo: GitHashAlgo) -> GitIndex []
+    todo("git-core-nv.gitindex.empty")
+
+// A `stat` block from the numbers a filesystem reported.
+//
+// Taking the ten numbers rather than reading them, so the whole of this
+// module stays `[]` and a test builds the case it wants.
+//
+// ```novo
+// use gitindex
+//
+// fn from_fs(size: Int, mtime: Int) -> GitStat
+//     gitindex.stat_of(0, 0, mtime, 0, 0, 0, 33188, 0, 0, size)
+//
+// fn main() [io]
+//     println("a stat block, as the index caches it")
+// ```
+pub fn stat_of(ctime_seconds: Int, ctime_nanos: Int, mtime_seconds: Int, mtime_nanos: Int, dev: Int,
+               ino: Int, mode: Int, uid: Int, gid: Int, size: Int) -> GitStat []
+    todo("git-core-nv.gitindex.stat_of")
+
+// The tree this index would commit, as the entries a tree writer needs.
+//
+// The step between `add` and `commit`, and the one that turns a flat
+// list of paths into nested trees.  Answers the entries for ONE
+// directory and the sub-directories it needs, so a caller builds the
+// trees bottom-up and writes each as it goes — which is what keeps the
+// memory of a hundred-thousand-file commit bounded.
+//
+// Refuses when the index has conflicts, because a commit over an
+// unresolved merge is the mistake this check exists to prevent.
+//
+// ```novo
+// use gitindex
+//
+// fn top(ix: GitIndex, paths: Bytes) -> Result<GitTreeLevel, GitIndexFault>
+//     gitindex.tree_level(ix, paths, "")
+//
+// fn main() [io]
+//     println("one directory's worth of a commit")
+// ```
+pub fn tree_level(ix: GitIndex, paths: Bytes, prefix: Str) -> Result<GitTreeLevel, GitIndexFault> []
+    todo("git-core-nv.gitindex.tree_level")
+
+// One directory's entries, and the sub-directories still to write.
+pub struct GitTreeLevel
+    // The blobs and submodules at this level, in git's tree order.
+    entries: [GitTreeEntry]
+    // The prefixes a caller must call `tree_level` on before it can
+    // finish this one.
+    subdirectories: [Str]
+
+// The extension with this signature, or `None`.
+//
+// ```novo
+// use gitindex
+//
+// fn cached(ix: GitIndex) -> ?GitIndexExtension
+//     gitindex.extension_of(ix, "TREE")
+//
+// fn main() [io]
+//     println("the cached-tree extension, if there is one")
+// ```
+pub fn extension_of(ix: GitIndex, signature: Str) -> ?GitIndexExtension []
+    todo("git-core-nv.gitindex.extension_of")
+
+// The path an entry names, as a string.
+//
+// ```novo
+// use gitindex
+//
+// fn named(e: GitIndexEntry, paths: Bytes) -> Str
+//     gitindex.path_of(e, paths)
+//
+// fn main() [io]
+//     println("one path out of the index")
+// ```
+pub fn path_of(e: GitIndexEntry, paths: Bytes) -> Str []
+    todo("git-core-nv.gitindex.path_of")
+
+// Which of these paths a `status` would call modified, without hashing
+// the ones it does not have to.
+//
+// The `stat`-cache fast path in one call: a caller supplying the
+// current `stat` for each path gets back only the ones that have to be
+// read.  `needs_rehash` is the same decision for one entry; this is the
+// batch, and it is where a `status` implementation actually starts.
+//
+// It is `[]` — the `stat` blocks are the caller's — so a tool can batch
+// its filesystem calls however it likes and still get git's answer.
+//
+// ```novo
+// use gitindex
+//
+// fn suspect(ix: GitIndex, paths: Bytes, now: [GitStat]) -> [Str]
+//     gitindex.paths_to_rehash(ix, paths, now, true, true)
+//
+// fn main() [io]
+//     println("the files that actually have to be read")
+// ```
+pub fn paths_to_rehash(ix: GitIndex, paths: Bytes, current: [GitStat], trust_ctime: Bool,
+                       check_stat: Bool) -> [Str] []
+    todo("git-core-nv.gitindex.paths_to_rehash")

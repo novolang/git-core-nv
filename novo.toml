@@ -1,0 +1,81 @@
+[package]
+name        = "git-core-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "The git object format with no filesystem: blobs, trees, commits and tags to and from bytes under SHA-1 or SHA-256, a packfile reader that asks its caller for byte ranges and resolves delta chains, the reference grammar and packed-refs, the index file with its stat cache, the ignore grammar and the blob diff.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and the whole package is `[]`.  This is the half git-nv's
+# README named: the object model, the packfile reader, the reference
+# grammar and the index file are arithmetic over bytes the caller
+# already holds, and they are where the git format actually lives.
+# git-nv keeps what performs — the filesystem, the working tree and the
+# smart HTTP client — and depends on this.
+#
+# The line between the two halves is the line between WHAT THE FORMAT
+# SAYS and WHERE THE BYTES CAME FROM.  A registry verifying a tag's
+# commit, a build cache keyed by a tree id and a signer reading a
+# commit's bytes all want the first without the second, and today they
+# cannot have it without taking a filesystem with them.
+layer       = "core"
+
+category    = "tooling"
+
+tags        = ["git", "packfile", "object-store", "refs", "index", "sans-io"]
+repository  = "https://github.com/novolang/git-core-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+#
+# NO DEVICE CLAIM, and so no `tests/embedded_probe.nv`.  `Bytes`, `Str`
+# and `Result` are throughout and a packfile is megabytes; a
+# microcontroller has no use for either.  The `core-embedded` audit row
+# passes on a package that makes no claim, and this one does not.
+
+[docs.pages]
+"README.md" = "The git format, with nothing that performs"
+
+[dependencies]
+# Object ids.  SHA-1 for the format git has, SHA-256 for the one it is
+# moving to, and this package has both — which is why the hash is a
+# parameter on every call that makes an id rather than a constant.
+#
+# The SHA-1 here is the plain one, NOT the collision-detecting variant
+# git itself now uses.  That difference is named in the README rather
+# than hidden: a repository carrying the two known colliding PDFs
+# produces objects this package will hash and git will refuse.
+crypto-nv = "^0.1.1"
+
+# zlib.  Every loose object is a zlib stream and so is every packed
+# object's payload, and `inflate.feed` is exactly the feed-and-drain
+# shape a pack reader over a caller's bytes needs — no file, no
+# allocation the caller did not ask for.
+flate-nv = "^0.0.2"
+
+# The diff.  `gitdiff.diff_blobs` tokenises two blobs and hands them to
+# `diffscript.diff`; the hunks a caller renders are diff-nv's, so a tool
+# that already renders a diff renders this one.
+#
+# Not a re-implementation: git's own diff is Myers with the same
+# patience and histogram variants diff-nv already publishes, and the
+# one thing git adds — rename detection by similarity — is arithmetic
+# over the scripts rather than a different algorithm.
+diff-nv = "^0.0.1"
+
+# All three are `core`, which is what lets this package be `core` at
+# all: a dependency's layer may not be wider than its consumer's, so a
+# `core` package that wanted a `host` dependency would have to stop
+# being one.

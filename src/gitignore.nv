@@ -1,0 +1,151 @@
+// gitignore.nv — the `.gitignore` grammar, which is not a glob.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE RULES ARE NOT glob-nv's, AND THAT IS WHY THIS MODULE EXISTS.
+// Git's ignore grammar has three things a plain glob does not: a `!`
+// negation whose ORDER matters, a rule that a pattern with no `/`
+// matches at any depth while one with a `/` in it is anchored to the
+// directory its file sits in, and a directory exclusion that stops the
+// walk so a negation inside it cannot re-include anything.  A tool that
+// handed the patterns to a glob matcher is right about the common cases
+// and wrong about `build/` against `*/build`, which is the pair people
+// actually write.
+//
+// THE LAST MATCHING RULE IN THE DEEPEST FILE WINS.  A search that
+// stopped at the first match gets every negation backwards, and a
+// reader that concatenated the files from the root down without keeping
+// their directories cannot anchor anything.  `gitignore_matches` takes
+// the whole stack in root-to-deepest order for that reason, and each
+// file carries the directory it governs.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]` —
+// the file's text is the caller's, so the whole grammar is testable
+// against git's own `t/t0008-ignores` cases with no working tree in the
+// room.  Reading the files is git-nv's `gitrepo`.
+
+// One parsed `.gitignore` file.
+//
+// The rules in order, because the LAST matching one decides and a
+// reader that stopped at the first gets every negation wrong.
+pub struct GitIgnoreFile
+    // The directory this file governs, relative to the work tree root.
+    // A rule's anchoring is relative to this, which is why the two
+    // travel together.
+    directory: Str
+    rules: [GitIgnoreRule]
+
+// One line of a `.gitignore`.
+pub struct GitIgnoreRule
+    pattern: Str
+    // A leading `!`: this rule RE-INCLUDES what an earlier one
+    // excluded.
+    negated: Bool
+    // A trailing `/`: matches directories only.
+    directory_only: Bool
+    // The pattern contains a `/` other than a trailing one, so it is
+    // anchored to `directory` rather than matching at any depth.  The
+    // rule most reimplementations miss, and the reason `build/` and
+    // `*/build` mean different things.
+    anchored: Bool
+
+// The rule that decided a path's fate.
+pub struct GitIgnoreMatch
+    directory: Str
+    rule: GitIgnoreRule
+    // Its position in that file, so a message can name a line.
+    line: Int
+
+// Parse one `.gitignore`.
+//
+// `[]` — the file's text is the caller's, so the whole ignore grammar
+// is testable with no filesystem.
+//
+// ```novo
+// use gitignore
+//
+// fn read(text: Str) -> GitIgnoreFile
+//     gitignore.parse_gitignore("", text)
+//
+// fn main() [io]
+//     println("a gitignore, as rules")
+// ```
+pub fn parse_gitignore(directory: Str, text: Str) -> GitIgnoreFile []
+    todo("git-core-nv.gitignore.parse_gitignore")
+
+// Is this path ignored, given the ignore files from the root down?
+//
+// The stack in root-to-deepest order, and the LAST matching rule in the
+// DEEPEST file wins — which is git's rule and is the opposite of what a
+// first-match search does.  `is_directory` matters because a
+// `directory_only` rule does not match a file of the same name.
+//
+// ```novo
+// use gitignore
+//
+// fn skipped(files: [GitIgnoreFile]) -> Bool
+//     gitignore.gitignore_matches(files, "build/out.o", false)
+//
+// fn main() [io]
+//     println("whether git would ignore a path")
+// ```
+pub fn gitignore_matches(files: [GitIgnoreFile], path: Str, is_directory: Bool) -> Bool []
+    todo("git-core-nv.gitignore.gitignore_matches")
+
+// Which rule decided, and in which file.
+//
+// `git check-ignore -v` as a value.  Published because "why is my file
+// ignored" is a question with a specific answer — a line number in a
+// particular file — and a boolean cannot give it.
+//
+// ```novo
+// use gitignore
+//
+// fn why(files: [GitIgnoreFile]) -> ?GitIgnoreMatch
+//     gitignore.gitignore_reason(files, "build/out.o", false)
+//
+// fn main() [io]
+//     println("which rule ignored a path")
+// ```
+pub fn gitignore_reason(files: [GitIgnoreFile], path: Str, is_directory: Bool) -> ?GitIgnoreMatch []
+    todo("git-core-nv.gitignore.gitignore_reason")
+
+// Does this rule stop the walk?
+//
+// A `directory_only` exclusion that matches a directory means git does
+// not descend into it at all, so a negation written INSIDE that
+// directory can never re-include anything — which is the rule that
+// makes `build/` plus `!build/keep.txt` keep nothing, and the one a
+// person is looking straight at when they ask why their file is still
+// ignored.
+//
+// ```novo
+// use gitignore
+//
+// fn pruned(r: GitIgnoreRule) -> Bool
+//     gitignore.prunes_directory(r)
+//
+// fn main() [io]
+//     println("whether a rule stops the walk")
+// ```
+pub fn prunes_directory(r: GitIgnoreRule) -> Bool []
+    todo("git-core-nv.gitignore.prunes_directory")
+
+// One rule, from one line of a file.
+//
+// Answers `None` for a blank line and for a comment, which are the two
+// things a `.gitignore` holds that are not rules.  A line beginning
+// `\#` is an escaped `#` and IS a rule, which is the case a split on
+// `#` gets wrong.
+//
+// ```novo
+// use gitignore
+//
+// fn one(line: Str) -> ?GitIgnoreRule
+//     gitignore.parse_rule(line)
+//
+// fn main() [io]
+//     println("one line of a gitignore")
+// ```
+pub fn parse_rule(line: Str) -> ?GitIgnoreRule []
+    todo("git-core-nv.gitignore.parse_rule")

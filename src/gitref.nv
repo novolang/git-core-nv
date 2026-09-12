@@ -1,0 +1,374 @@
+// gitref.nv — the names a repository gives its commits, and the rules
+// about what a name may be.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `check_ref_format` IS THE LOAD-BEARING CALL IN THIS MODULE, and the
+// reason is that a ref name is a FILE PATH.  A loose ref lives at
+// `.git/refs/heads/<name>`, so a name containing `..` walks out of the
+// repository, a name starting with `/` is absolute, and a name a
+// Windows filesystem normalises collides with one it does not.  Every
+// one of those is a path traversal in a tool that creates a ref from
+// something a server sent — and a fetch does exactly that, with a name
+// a stranger chose.
+//
+// Git's own `git check-ref-format` is the reference, its rules are a
+// closed list, and they are published here one variant per rule so that
+// a refusal can say WHICH — because "invalid ref name" tells a person
+// nothing about a name they are looking straight at.
+//
+// PACKED REFS AND LOOSE REFS DISAGREE, AND THE LOOSE ONE WINS.  A
+// repository holds a ref in `.git/refs/...` and ALSO in
+// `.git/packed-refs`, and after `git pack-refs` followed by a branch
+// update it holds both with different values.  Git's rule is that the
+// loose file wins; a reader that concatenated the two sources reports a
+// branch at the commit it was at before the last commit, which is the
+// most confusing possible wrong answer.  `merge_sources` is that rule.
+//
+// A PEELED REF IS A SECOND FACT.  `packed-refs` stores an annotated
+// tag's own id and, on the following line beginning `^`, the id of the
+// commit it points at.  A reader that dropped the second has to load the
+// tag object to answer "what commit is v1.2.0", which is the question
+// every release tool asks.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]` —
+// reading the files is git-nv's `gitrepo`.
+
+use gitobj
+
+// What a reference is.
+//
+// Two kinds and no third: a ref names an object, or it names another
+// ref.  `HEAD` is the symbolic one everybody meets, and a repository
+// may have others.
+pub enum GitRefTarget
+    GitRefDirect(oid: GitOid)
+    // `ref: refs/heads/main`.  The value is the other ref's full name.
+    GitRefSymbolic(points_to: Str)
+
+// One reference.
+//
+// `name` is the FULL name — `refs/heads/main`, not `main` — because a
+// short name is ambiguous and resolving it needs the whole ref list.
+// `gitref.expand` is that resolution, and it is separate so that a
+// caller which already has a full name does not pay for it.
+pub struct GitRef
+    name: Str
+    target: GitRefTarget
+    // For an annotated tag in `packed-refs`, the commit it peels to.
+    peeled: ?GitOid
+
+// Why a ref name is not one.
+//
+// Git's own rules, one variant each, because a message that names the
+// rule is the difference between a person fixing the name and a person
+// guessing.
+pub enum GitRefNameFault
+    // Empty, or a component of it is.
+    GitRefEmptyComponent(at: Int)
+    // Starts with `.`, or contains `/.`.
+    GitRefLeadingDot(at: Int)
+    // Contains `..`.  The path traversal, and the reason this whole
+    // check exists.
+    GitRefDoubleDot(at: Int)
+    // Ends with `/`, or with `.lock` — the second because git writes
+    // `<ref>.lock` while updating and a ref by that name collides with
+    // the lock.
+    GitRefBadSuffix(at: Int)
+    // Contains an ASCII control character, a space, or one of
+    // `~ ^ : ? * [ \`.
+    GitRefBadCharacter(at: Int, byte: Int)
+    // Contains `@{`, which is git's reflog syntax.
+    GitRefAtBrace(at: Int)
+    // Is exactly `@`.
+    GitRefBareAt
+    // Contains `//`, or begins or ends with `/`.
+    GitRefBadSlash(at: Int)
+
+// The standard `Error` implementation.
+impl Error for GitRefNameFault
+    // One line: which rule the name broke, and where in it.
+    fn message(self) -> Str
+        todo("git-core-nv.gitref.GitRefNameFault.message")
+
+// Is this a name git would accept?
+//
+// Answers EVERY rule the name breaks rather than the first, because a
+// name a person typed usually breaks one and a name a script generated
+// often breaks three, and fixing them one error at a time is three
+// round trips.
+//
+// The list is empty for a good name, which is the whole check.
+//
+// ```novo
+// use gitref
+//
+// fn faults(name: Str) -> [GitRefNameFault]
+//     gitref.check_ref_format(name)
+//
+// fn main() [io]
+//     println("${list.len(gitref.check_ref_format("refs/heads/main"))}")
+// ```
+pub fn check_ref_format(name: Str) -> [GitRefNameFault] []
+    todo("git-core-nv.gitref.check_ref_format")
+
+// Is this name safe to turn into a path under `.git`?
+//
+// `check_ref_format` with nothing found, said as a predicate, because
+// that is the shape a fetch's guard wants and a list comparison at that
+// call site is where the guard gets written wrong.
+//
+// ```novo
+// use gitref
+//
+// fn ok(name: Str) -> Bool
+//     gitref.is_valid_name(name)
+//
+// fn main() [io]
+//     println("${gitref.is_valid_name("refs/heads/../../etc/passwd")}")
+// ```
+pub fn is_valid_name(name: Str) -> Bool []
+    todo("git-core-nv.gitref.is_valid_name")
+
+// Parse a `packed-refs` file.
+//
+// The `# pack-refs with: peeled fully-peeled sorted` header line is read
+// and its capabilities are answered beside the refs, because
+// `fully-peeled` is what says an absent `^` line means "not a tag"
+// rather than "not peeled yet" — and a reader that assumed the first on
+// an old file answers that a tag points at itself.
+//
+// ```novo
+// use gitref
+//
+// fn read(text: Str) -> Result<GitPackedRefs, GitRefNameFault>
+//     gitref.parse_packed_refs(text, GitSha1)
+//
+// fn main() [io]
+//     println("the refs a repository packed")
+// ```
+pub fn parse_packed_refs(text: Str, algo: GitHashAlgo) -> Result<GitPackedRefs, GitRefNameFault> []
+    todo("git-core-nv.gitref.parse_packed_refs")
+
+// A parsed `packed-refs`.
+pub struct GitPackedRefs
+    refs: [GitRef]
+    // The header said `fully-peeled`: every annotated tag in this file
+    // carries its `^` line, so a ref without one is not a tag.
+    fully_peeled: Bool
+    // The header said `sorted`: the entries are in name order, so a
+    // lookup may binary-search.
+    sorted: Bool
+
+// Parse the contents of one loose ref file.
+//
+// Either 40 or 64 hex characters, or `ref: <name>`.  Trailing whitespace
+// is allowed because git tolerates it and repositories in the world
+// contain it.
+//
+// ```novo
+// use gitref
+//
+// fn read(name: Str, contents: Str) -> Result<GitRef, GitRefNameFault>
+//     gitref.parse_loose_ref(name, contents, GitSha1)
+//
+// fn main() [io]
+//     println("one ref, out of its own file")
+// ```
+pub fn parse_loose_ref(name: Str, contents: Str,
+                       algo: GitHashAlgo) -> Result<GitRef, GitRefNameFault> []
+    todo("git-core-nv.gitref.parse_loose_ref")
+
+// The bytes a loose ref file holds for this ref.
+//
+// Including the trailing newline, which git writes and some tools omit —
+// and a ref file without one is read correctly by git and reported as
+// modified by every tool that compares files.
+//
+// ```novo
+// use gitref
+//
+// fn written(r: GitRef) -> Str
+//     gitref.serialise_loose_ref(r)
+//
+// fn main() [io]
+//     println("what a ref file contains")
+// ```
+pub fn serialise_loose_ref(r: GitRef) -> Str []
+    todo("git-core-nv.gitref.serialise_loose_ref")
+
+// The loose refs and the packed refs, resolved to one list.
+//
+// THE LOOSE FILE WINS, which is git's rule and the one a reader gets
+// wrong by concatenating.  A ref present in both is the loose one; a ref
+// present only in `packed-refs` is kept; and a ref whose loose file
+// exists but is empty is DELETED rather than packed — git writes an
+// empty loose file as a tombstone over a packed ref, and a reader that
+// skipped it reports a branch that no longer exists.
+//
+// ```novo
+// use gitref
+//
+// fn all(loose: [GitRef], packed: GitPackedRefs) -> [GitRef]
+//     gitref.merge_sources(loose, packed)
+//
+// fn main() [io]
+//     println("every ref a repository has, once each")
+// ```
+pub fn merge_sources(loose: [GitRef], packed: GitPackedRefs) -> [GitRef] []
+    todo("git-core-nv.gitref.merge_sources")
+
+// The full name a short one means, given the refs that exist.
+//
+// Git's own precedence, in order: the name itself, `refs/<name>`,
+// `refs/tags/<name>`, `refs/heads/<name>`, `refs/remotes/<name>`,
+// `refs/remotes/<name>/HEAD`.  A tag beats a branch, which surprises
+// people and is why the order is published rather than assumed — a tool
+// that checked branches first resolves `v1.0` to a branch somebody made
+// by mistake and builds the wrong commit.
+//
+// ```novo
+// use gitref
+//
+// fn full(refs: [GitRef], short: Str) -> ?Str
+//     gitref.expand(refs, short)
+//
+// fn main() [io]
+//     println("the full name a short one means")
+// ```
+pub fn expand(refs: [GitRef], short: Str) -> ?Str []
+    todo("git-core-nv.gitref.expand")
+
+// The short name a person would write for this full one.
+//
+// The inverse, and it is NOT total: two refs can shorten to the same
+// thing — a tag and a branch both called `release` — and this answers
+// the full name in that case rather than an ambiguous short one.
+//
+// ```novo
+// use gitref
+//
+// fn short(refs: [GitRef], full: Str) -> Str
+//     gitref.shorten(refs, full)
+//
+// fn main() [io]
+//     println("the name a person would write")
+// ```
+pub fn shorten(refs: [GitRef], full: Str) -> Str []
+    todo("git-core-nv.gitref.shorten")
+
+// Follow symbolic refs to the object one names.
+//
+// `HEAD` on a branch is `ref: refs/heads/main`, and resolving it is a
+// walk.  The walk is bounded at five, which is git's own limit: a
+// repository whose `HEAD` points at itself is a repository a tool must
+// report rather than hang in.
+//
+// `None` when the chain ends at a ref that does not exist, which is what
+// an unborn branch looks like — a fresh repository's `HEAD` names
+// `refs/heads/main` and that file is not there until the first commit,
+// and every tool that assumed `HEAD` resolves is broken on an empty
+// repository.
+//
+// ```novo
+// use gitref
+//
+// fn at(refs: [GitRef], name: Str) -> ?GitOid
+//     gitref.resolve(refs, name)
+//
+// fn main() [io]
+//     println("the object a ref names, symbolic or not")
+// ```
+pub fn resolve(refs: [GitRef], name: Str) -> ?GitOid []
+    todo("git-core-nv.gitref.resolve")
+
+// Is this ref name a branch?
+//
+// `refs/heads/…`.  Three predicates rather than a prefix comparison at
+// every call site, because the prefix is where a typo produces a tool
+// that quietly lists nothing.
+//
+// ```novo
+// use gitref
+//
+// fn main() [io]
+//     println("${gitref.is_branch("refs/heads/main")}")
+// ```
+pub fn is_branch(name: Str) -> Bool []
+    todo("git-core-nv.gitref.is_branch")
+
+// Is this ref name a tag?
+//
+// ```novo
+// use gitref
+//
+// fn main() [io]
+//     println("${gitref.is_tag("refs/tags/v1.0.0")}")
+// ```
+pub fn is_tag(name: Str) -> Bool []
+    todo("git-core-nv.gitref.is_tag")
+
+// Is this ref name a remote-tracking branch?
+//
+// ```novo
+// use gitref
+//
+// fn main() [io]
+//     println("${gitref.is_remote("refs/remotes/origin/main")}")
+// ```
+pub fn is_remote(name: Str) -> Bool []
+    todo("git-core-nv.gitref.is_remote")
+
+// The refs a name pattern selects.
+//
+// The pattern is git's own refspec left-hand side: a full name, or a
+// prefix ending `/*`.  Published because `novo pkg add`'s version
+// resolution is exactly "the tags under `refs/tags/*`", and doing it
+// with a string comparison misses the refs a repository keeps under a
+// deeper path.
+//
+// ```novo
+// use gitref
+//
+// fn tags(refs: [GitRef]) -> [GitRef]
+//     gitref.matching(refs, "refs/tags/*")
+//
+// fn main() [io]
+//     println("every tag a repository has")
+// ```
+pub fn matching(refs: [GitRef], pattern: Str) -> [GitRef] []
+    todo("git-core-nv.gitref.matching")
+
+// The commit a ref finally names, peeling an annotated tag.
+//
+// `peeled` when the ref carries one, which is the case `packed-refs`
+// answers without loading anything; `None` when it does not, and the
+// caller loads the tag object and asks `gitobj.parse_tag`.  Two answers
+// rather than one, because the fast path is the one a release tool takes
+// a thousand times and the slow one is a fallback.
+//
+// ```novo
+// use gitref
+//
+// fn commit(r: GitRef) -> ?GitOid
+//     gitref.peeled_of(r)
+//
+// fn main() [io]
+//     println("the commit a tag points at, without loading it")
+// ```
+pub fn peeled_of(r: GitRef) -> ?GitOid []
+    todo("git-core-nv.gitref.peeled_of")
+
+// The name `HEAD` has.
+//
+// A function rather than a literal, because `HEAD` is not under `refs/`
+// and every prefix-based path builder gets it wrong once.
+//
+// ```novo
+// use gitref
+//
+// fn main() [io]
+//     println(gitref.head_name())
+// ```
+pub fn head_name() -> Str []
+    todo("git-core-nv.gitref.head_name")

@@ -1,0 +1,136 @@
+// gitref_tests.nv — a ref name is a file path, and the loose file
+// wins.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-core-nv.gitref.<fn>`.
+//
+// WHERE THE VECTORS CAME FROM.  The names below are git's own
+// `t/t1402-check-ref-format.sh` cases — the ones its suite asserts are
+// refused, and the ones it asserts are accepted.  Each one is a rule in
+// `git check-ref-format`'s documented list, and this package publishes
+// one variant per rule so a refusal can say WHICH.
+
+use std.test
+use std.list
+use std.str
+use gitobj
+use gitref
+
+@test
+fn test_a_good_name_breaks_no_rules() [io]
+    test.case("a branch")
+    test.assert_eq(list.len(gitref.check_ref_format("refs/heads/main")), 0)
+
+    test.case("a tag")
+    test.assert_eq(list.len(gitref.check_ref_format("refs/tags/v1.0.0")), 0)
+
+    test.case("and the predicate says the same thing")
+    test.assert(gitref.is_valid_name("refs/heads/main"))
+
+@test
+fn test_a_ref_name_is_a_file_path_and_dot_dot_walks_out_of_it() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A loose ref lives at
+    // `.git/refs/heads/<name>`, and a fetch creates refs from names a
+    // remote chose.  A name containing `..` is a path traversal in any
+    // tool that writes one.
+    test.case("the traversal")
+    test.assert(gitref.is_valid_name("refs/heads/../../etc/passwd") == false)
+    test.assert(list.len(gitref.check_ref_format("refs/heads/../../etc/passwd")) > 0)
+
+    test.case("an empty component")
+    test.assert(gitref.is_valid_name("refs//heads/main") == false)
+
+    test.case("a leading dot in a component")
+    test.assert(gitref.is_valid_name("refs/heads/.hidden") == false)
+
+    test.case("the lock suffix git writes while updating a ref")
+    test.assert(gitref.is_valid_name("refs/heads/main.lock") == false)
+
+    test.case("a space, and the characters a revision expression uses")
+    test.assert(gitref.is_valid_name("refs/heads/a b") == false)
+    test.assert(gitref.is_valid_name("refs/heads/a~1") == false)
+    test.assert(gitref.is_valid_name("refs/heads/a^") == false)
+    test.assert(gitref.is_valid_name("refs/heads/a:b") == false)
+
+    test.case("the reflog syntax")
+    test.assert(gitref.is_valid_name("refs/heads/main@{1}") == false)
+
+    test.case("and a bare at sign is a name of its own")
+    test.assert(gitref.is_valid_name("@") == false)
+
+@test
+fn test_every_broken_rule_is_answered_not_only_the_first() [io]
+    // A name a person typed usually breaks one rule and a name a
+    // script generated often breaks three, and fixing them one error
+    // at a time is three round trips.
+    test.case("a name that breaks several says so several times")
+    test.assert(list.len(gitref.check_ref_format("refs/heads/../a b.lock")) > 1)
+
+@test
+fn test_the_loose_file_wins_and_an_empty_one_is_a_deletion() [io]
+    // A repository holds a ref in `refs/...` AND in `packed-refs`, and
+    // after `git pack-refs` followed by a branch update it holds both
+    // with different values.  A reader that concatenated the two
+    // reports a branch at the commit before its last.
+    let packed = GitPackedRefs { refs: [], fully_peeled: true, sorted: true }
+    test.case("nothing loose and nothing packed is no refs")
+    test.assert_eq(list.len(gitref.merge_sources([], packed)), 0)
+
+@test
+fn test_a_short_name_resolves_by_git_s_precedence_and_a_tag_beats_a_branch() [io]
+    // A tool that checked branches first resolves `v1.0` to a branch
+    // somebody made by mistake and builds the wrong commit.
+    test.case("with no refs at all, nothing expands")
+    test.assert_none(gitref.expand([], "main"))
+
+    test.case("and nothing resolves")
+    test.assert_none(gitref.resolve([], "HEAD"))
+
+@test
+fn test_the_three_prefixes_are_predicates_and_head_is_not_under_refs() [io]
+    test.case("a branch")
+    test.assert(gitref.is_branch("refs/heads/main"))
+    test.assert(gitref.is_tag("refs/heads/main") == false)
+
+    test.case("a tag")
+    test.assert(gitref.is_tag("refs/tags/v1.0.0"))
+
+    test.case("a remote-tracking branch")
+    test.assert(gitref.is_remote("refs/remotes/origin/main"))
+
+    test.case("and HEAD, which is none of them")
+    test.assert_eq_str(gitref.head_name(), "HEAD")
+    test.assert(gitref.is_branch(gitref.head_name()) == false)
+
+@test
+fn test_a_loose_ref_file_round_trips_with_its_newline() [io]
+    // Git writes the trailing newline and some tools omit it; a ref
+    // file without one is read correctly by git and reported as
+    // modified by every tool that compares files.
+    test.case("parsing zeros is not a ref")
+    match gitref.parse_loose_ref("refs/heads/main", "", gitobj.GitSha1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a packed-refs file with no header still parses")
+    match gitref.parse_packed_refs("", gitobj.GitSha1)
+        Err(_) => test.assert(false)
+        Ok(p)  => test.assert_eq(list.len(p.refs), 0)
+
+@test
+fn test_a_ref_is_written_back_the_way_it_is_read() [io]
+    // The trailing newline is written; a ref file without one is read
+    // correctly and reported as modified by every tool that compares
+    // files.
+    let r = GitRef {
+        name: "refs/heads/main",
+        target: gitref.GitRefDirect(oid: gitobj.null_oid(gitobj.GitSha1)),
+        peeled: None }
+    test.case("the file's contents are an id and a newline")
+    test.assert(str.len(gitref.serialise_loose_ref(r)) > 40)
+
+    test.case("a branch carries no peeled commit — only a packed tag does")
+    test.assert_none(gitref.peeled_of(r))
+
+    test.case("and shortening a full name is the inverse of expanding one")
+    test.assert_eq_str(gitref.shorten([r], "refs/heads/main"), "main")

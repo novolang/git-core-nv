@@ -1,0 +1,593 @@
+// gitobj.nv — the four things a repository is made of, to and from
+// bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// AN OBJECT IS ITS BYTES, AND ITS ID IS A FACT ABOUT THEM.  Git is a
+// content-addressed store: the id of an object is the hash of
+// `"<kind> <length>\0"` followed by the payload, so `oid_of` is not a
+// lookup and cannot be wrong — serialise and hash, and the answer is the
+// name the object has in every clone of the repository that ever
+// existed.  That is why `serialise` and `oid_of` are separate calls and
+// why both are `[]`: nothing is read, nothing is written, and a caller
+// that already has the bytes can verify an id without a store at all.
+//
+// THE HASH IS A PARAMETER.  Git is in the middle of moving from SHA-1
+// to SHA-256, a repository declares which it uses, and the two produce
+// different ids for identical content — so a package with one hard-coded
+// would be unable to read half the repositories it meets.  Every call
+// that makes an id takes a `GitHashAlgo`, and `GitOid` carries which one
+// made it, so comparing ids from two repositories is a type-level
+// mistake rather than a silent false negative.
+//
+// THE SHA-1 IS THE PLAIN ONE.  Git uses SHA-1DC, which detects the
+// known collision attack and refuses; crypto-nv has plain SHA-1.  For
+// every object anybody has actually committed the two agree, and for the
+// handful of crafted collisions they do not: this package would hash
+// them and git would refuse.  It is named here rather than discovered.
+//
+// A PARSE ANSWERS SPANS WHERE IT CAN.  A commit message and a tree's
+// filenames are the bulk of a repository's bytes, and a reader that
+// copied every one of them would allocate the whole history to walk it.
+// `GitTreeEntry.name` and `GitCommit.message` are ranges into the bytes
+// the caller passed in, so walking a million-entry tree allocates a list
+// of small records and no strings at all.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// Which hash a repository names its objects with.
+//
+// The two git defines.  A repository's `extensions.objectFormat` says
+// which, and it may not be changed after the repository exists.
+pub enum GitHashAlgo
+    // 20 bytes, 40 hex characters.  Every repository that predates 2021
+    // and nearly every one since.
+    GitSha1
+    // 32 bytes, 64 hex characters.
+    GitSha256
+
+// An object's name.
+//
+// The raw bytes and the algorithm that produced them.  Raw rather than
+// hex, because an id is compared and indexed far more often than it is
+// shown, and a 40-character string comparison is five times the work of
+// a 20-byte one — a packfile index lookup does thousands per fetch.
+//
+// The algorithm is carried so that `oid_eq` can refuse to answer `true`
+// for two ids of different widths, which is the one way a mixed-hash
+// tool silently reports that an object is missing.
+pub struct GitOid
+    bytes: [u8]
+    algo: GitHashAlgo
+
+// What an object is.
+//
+// Four, and there is no fifth: git's object database has exactly these,
+// and a packfile's delta types are a pack-level encoding rather than an
+// object kind — which is why they live in `gitpack` and not here.
+pub enum GitObjKind
+    GitKindBlob
+    GitKindTree
+    GitKindCommit
+    GitKindTag
+
+// One entry in a tree.
+//
+// `mode` is the octal git stores — `100644`, `100755`, `120000`,
+// `040000`, `160000` — as the integer it spells, because the set is
+// closed and a caller branches on it.  `name_at` and `name_len` are a
+// range into the bytes the tree was parsed from.
+pub struct GitTreeEntry
+    mode: Int
+    name_at: Int
+    name_len: Int
+    oid: GitOid
+
+// A parsed tree.
+//
+// Entries in the order the bytes had them, which is git's own sort
+// order and not an ordinary lexicographic one: a directory sorts as
+// though its name ended in `/`, so `foo.txt` comes before `foo/bar` in
+// a tree and after it in a naive sort.  `entries_sorted` is that rule
+// published, because a tool that writes a tree with the wrong order
+// produces an object git reads and whose id does not match what git
+// would have written.
+pub struct GitTree
+    entries: [GitTreeEntry]
+
+// Who did something, and when.
+//
+// `when_unix` and `tz_offset_minutes` rather than a formatted string,
+// because git stores exactly those two numbers and a package that parsed
+// them into a date would need a calendar and would lose the offset a
+// commit was made in — which is the one thing a reader of an old commit
+// wants to know.
+pub struct GitSignature
+    name_at: Int
+    name_len: Int
+    email_at: Int
+    email_len: Int
+    when_unix: Int
+    // Minutes east of UTC, as git's `+0200` spells it.
+    tz_offset_minutes: Int
+
+// A parsed commit.
+//
+// `parents` is a list because a merge has several and the ORDER is
+// load-bearing: the first parent is the branch that was merged into, and
+// `git log --first-parent` — the only way to read a busy repository's
+// history — is a walk over exactly that field.
+pub struct GitCommit
+    tree: GitOid
+    parents: [GitOid]
+    author: GitSignature
+    committer: GitSignature
+    // A range into the bytes, because a message is the bulk of a
+    // commit and a walk over ten thousand of them should allocate
+    // none of them.
+    message_at: Int
+    message_len: Int
+    // The headers this package does not model, in order, as ranges:
+    // `gpgsig`, `encoding`, `mergetag`, and whatever a future git adds.
+    // Kept rather than dropped, because re-serialising a commit without
+    // them changes its id.
+    extra_headers: [GitHeaderSpan]
+
+// One header line this package does not interpret.
+pub struct GitHeaderSpan
+    key_at: Int
+    key_len: Int
+    value_at: Int
+    value_len: Int
+
+// A parsed annotated tag.
+pub struct GitTag
+    target: GitOid
+    target_kind: GitObjKind
+    name_at: Int
+    name_len: Int
+    tagger: GitSignature
+    message_at: Int
+    message_len: Int
+
+// Why some bytes are not the object they claimed to be.
+//
+// Every arm is a real corruption or a real version skew, and they are
+// separate because the remedy differs: a bad header is a truncated
+// download, a bad mode is a tool that wrote the tree, and a mismatched
+// id is a disk that lied.
+pub enum GitObjFault
+    // No `"<kind> <length>\0"` prefix.
+    GitBadObjectHeader(at: Int)
+    // A kind word that is not one of the four.
+    GitUnknownKind(at: Int, found: Str)
+    // The header's declared length is not the payload's.
+    GitLengthMismatch(declared: Int, actual: Int)
+    // A tree entry whose mode is not one git defines.
+    GitBadTreeMode(at: Int, mode: Int)
+    // A tree entry, commit header or tag line that ends where it should
+    // not.
+    GitTruncated(at: Int, wanted: Int)
+    // An id of the wrong width for the algorithm in play.  `wanted` and
+    // `found` are byte counts, so the message can say 20 against 32
+    // rather than "bad oid".
+    GitBadOidWidth(at: Int, wanted: Int, found: Int)
+    // A commit or tag header that is not `key SP value LF`.
+    GitBadHeaderLine(at: Int)
+    // The object's bytes hash to something other than the id it was
+    // asked for.  The one fault that means the STORE is wrong rather
+    // than the writer.
+    GitOidMismatch(wanted: Str, found: Str)
+
+// The standard `Error` implementation, so a corrupt object can be
+// reported by anything that reports errors.
+impl Error for GitObjFault
+    // One line: what was wrong, and at what byte offset into the object.
+    //
+    // The offset is in the message rather than left to the caller,
+    // because an object has no line numbers and no other landmark.
+    fn message(self) -> Str
+        todo("git-core-nv.gitobj.GitObjFault.message")
+
+// The id of these bytes, as this kind, under this hash.
+//
+// The whole of content addressing in one call: the header is prepended
+// here, so a caller cannot forget it — which is the single commonest
+// mistake in a hand-written git tool and produces ids that are wrong for
+// every object.
+//
+// ```novo
+// use gitobj
+//
+// fn name_of(payload: Bytes) -> GitOid
+//     gitobj.oid_of(GitKindBlob, payload, GitSha1)
+//
+// fn main() [io]
+//     println("the name a blob has in every clone")
+// ```
+pub fn oid_of(kind: GitObjKind, payload: Bytes, algo: GitHashAlgo) -> GitOid []
+    todo("git-core-nv.gitobj.oid_of")
+
+// The bytes git stores for an object: the header and the payload.
+//
+// What `oid_of` hashes, and what a loose object's zlib stream contains.
+// Published separately because a caller writing an object needs both,
+// and computing the id twice to get them is the shape that goes wrong.
+//
+// ```novo
+// use gitobj
+//
+// fn stored(payload: Bytes) -> Bytes
+//     gitobj.framed(GitKindBlob, payload)
+//
+// fn main() [io]
+//     println("the bytes a loose object compresses")
+// ```
+pub fn framed(kind: GitObjKind, payload: Bytes) -> Bytes []
+    todo("git-core-nv.gitobj.framed")
+
+// The kind and the payload's range, from framed bytes.
+//
+// A RANGE rather than a copy: a 40 MB blob's payload is the caller's
+// bytes with an offset, and a reader that copied it would double the
+// memory of every checkout.
+//
+// ```novo
+// use gitobj
+//
+// fn opened(raw: Bytes) -> Result<GitFramed, GitObjFault>
+//     gitobj.unframe(raw)
+//
+// fn main() [io]
+//     println("an object's kind and where its payload starts")
+// ```
+pub fn unframe(raw: Bytes) -> Result<GitFramed, GitObjFault> []
+    todo("git-core-nv.gitobj.unframe")
+
+// What `unframe` found: the kind, and where the payload is.
+pub struct GitFramed
+    kind: GitObjKind
+    payload_at: Int
+    payload_len: Int
+
+// A tree, from its payload.
+//
+// ```novo
+// use gitobj
+//
+// fn walk(payload: Bytes) -> Result<GitTree, GitObjFault>
+//     gitobj.parse_tree(payload)
+//
+// fn main() [io]
+//     println("a directory, as git stores it")
+// ```
+pub fn parse_tree(payload: Bytes) -> Result<GitTree, GitObjFault> []
+    todo("git-core-nv.gitobj.parse_tree")
+
+// A commit, from its payload.
+//
+// ```novo
+// use gitobj
+//
+// fn read(payload: Bytes) -> Result<GitCommit, GitObjFault>
+//     gitobj.parse_commit(payload)
+//
+// fn main() [io]
+//     println("a commit, as git stores it")
+// ```
+pub fn parse_commit(payload: Bytes) -> Result<GitCommit, GitObjFault> []
+    todo("git-core-nv.gitobj.parse_commit")
+
+// An annotated tag, from its payload.
+//
+// ```novo
+// use gitobj
+//
+// fn read(payload: Bytes) -> Result<GitTag, GitObjFault>
+//     gitobj.parse_tag(payload)
+//
+// fn main() [io]
+//     println("an annotated tag, as git stores it")
+// ```
+pub fn parse_tag(payload: Bytes) -> Result<GitTag, GitObjFault> []
+    todo("git-core-nv.gitobj.parse_tag")
+
+// A tree's payload, written back.
+//
+// Byte-identical to what git writes for the same entries, which is the
+// property that makes it usable: an id computed over this is the id git
+// would have given the tree.  `entries_sorted` has to hold, and
+// `serialise_tree` refuses when it does not rather than writing an
+// object nothing else agrees about.
+//
+// ```novo
+// use gitobj
+//
+// fn written(t: GitTree, names: Bytes) -> Result<Bytes, GitObjFault>
+//     gitobj.serialise_tree(t, names)
+//
+// fn main() [io]
+//     println("a tree, back to bytes")
+// ```
+pub fn serialise_tree(t: GitTree, names: Bytes) -> Result<Bytes, GitObjFault> []
+    todo("git-core-nv.gitobj.serialise_tree")
+
+// A commit's payload, written back.
+//
+// The extra headers go back in the order they came out, which is what
+// keeps a round trip id-preserving on a signed commit — `gpgsig` is an
+// extra header, and a commit re-serialised without it has a different
+// id and a signature over nothing.
+//
+// ```novo
+// use gitobj
+//
+// fn written(c: GitCommit, src: Bytes) -> Result<Bytes, GitObjFault>
+//     gitobj.serialise_commit(c, src)
+//
+// fn main() [io]
+//     println("a commit, back to bytes")
+// ```
+pub fn serialise_commit(c: GitCommit, src: Bytes) -> Result<Bytes, GitObjFault> []
+    todo("git-core-nv.gitobj.serialise_commit")
+
+// Are these entries in git's tree order?
+//
+// The rule: compare names byte by byte, and a directory compares as
+// though its name ended in `/`.  So `foo.txt` sorts BEFORE `foo/bar`,
+// which a plain lexicographic sort gets the other way round — and a
+// tree written in the wrong order is an object git reads happily and
+// whose id does not match what git would have written, so two clones
+// disagree about whether they have the same tree.
+//
+// ```novo
+// use gitobj
+//
+// fn ok(t: GitTree, names: Bytes) -> Bool
+//     gitobj.entries_sorted(t, names)
+//
+// fn main() [io]
+//     println("whether a tree is in the order git would write")
+// ```
+pub fn entries_sorted(t: GitTree, names: Bytes) -> Bool []
+    todo("git-core-nv.gitobj.entries_sorted")
+
+// An id from its hex spelling.
+//
+// `None` on anything that is not the right number of lowercase hex
+// characters for the algorithm, because a short id is a LOOKUP — it may
+// name several objects — and resolving one needs the store.
+// git-nv's `gitrepo.resolve_abbrev` is that call.
+//
+// ```novo
+// use gitobj
+//
+// fn named(hex: Str) -> ?GitOid
+//     gitobj.oid_of_hex(hex, GitSha1)
+//
+// fn main() [io]
+//     println("an id, from what a person typed")
+// ```
+pub fn oid_of_hex(hex: Str, algo: GitHashAlgo) -> ?GitOid []
+    todo("git-core-nv.gitobj.oid_of_hex")
+
+// An id as the lowercase hex a person reads.
+//
+// ```novo
+// use gitobj
+//
+// fn shown(o: GitOid) -> Str
+//     gitobj.oid_hex(o)
+//
+// fn main() [io]
+//     println("an id, as it is written down")
+// ```
+pub fn oid_hex(o: GitOid) -> Str []
+    todo("git-core-nv.gitobj.oid_hex")
+
+// The same id, shortened to `n` characters for a person.
+//
+// It does not check that `n` is enough to be unique — that needs the
+// store, and git-nv's `gitrepo.shortest_unique` is the call that does.
+// This one is the rendering, so a tool that already knows the width
+// prints without a filesystem in the room.
+//
+// ```novo
+// use gitobj
+//
+// fn shown(o: GitOid) -> Str
+//     gitobj.oid_abbrev(o, 7)
+//
+// fn main() [io]
+//     println("an id, shortened")
+// ```
+pub fn oid_abbrev(o: GitOid, n: Int) -> Str []
+    todo("git-core-nv.gitobj.oid_abbrev")
+
+// Are these two ids the same object?
+//
+// `false` when the algorithms differ, whatever the bytes.  A SHA-1 id
+// and a SHA-256 id are names in two different namespaces, and a
+// comparison that ignored that would report "object missing" on every
+// lookup across a conversion — silently, because nothing is wrong with
+// either id.
+//
+// ```novo
+// use gitobj
+//
+// fn same(a: GitOid, b: GitOid) -> Bool
+//     gitobj.oid_eq(a, b)
+//
+// fn main() [io]
+//     println("whether two names are one object")
+// ```
+pub fn oid_eq(a: GitOid, b: GitOid) -> Bool []
+    todo("git-core-nv.gitobj.oid_eq")
+
+// The all-zero id, which git uses to mean "no object".
+//
+// A reflog's first entry, a deleted ref's old value and a push that
+// creates a branch all carry it, so a reader meets it early.
+//
+// ```novo
+// use gitobj
+//
+// fn nothing() -> GitOid
+//     gitobj.null_oid(GitSha1)
+//
+// fn main() [io]
+//     println("the id that names no object")
+// ```
+pub fn null_oid(algo: GitHashAlgo) -> GitOid []
+    todo("git-core-nv.gitobj.null_oid")
+
+// Is this the all-zero id?
+//
+// ```novo
+// use gitobj
+//
+// fn absent(o: GitOid) -> Bool
+//     gitobj.oid_is_null(o)
+//
+// fn main() [io]
+//     println("whether an id names no object")
+// ```
+pub fn oid_is_null(o: GitOid) -> Bool []
+    todo("git-core-nv.gitobj.oid_is_null")
+
+// How many bytes an id is under this algorithm: 20 or 32.
+//
+// ```novo
+// use gitobj
+//
+// fn main() [io]
+//     println("${gitobj.oid_width(GitSha1)}")
+// ```
+pub fn oid_width(algo: GitHashAlgo) -> Int []
+    todo("git-core-nv.gitobj.oid_width")
+
+// The kind as the word the object header carries: `blob`, `tree`,
+// `commit`, `tag`.
+//
+// ```novo
+// use gitobj
+//
+// fn main() [io]
+//     println(gitobj.kind_word(GitKindCommit))
+// ```
+pub fn kind_word(k: GitObjKind) -> Str []
+    todo("git-core-nv.gitobj.kind_word")
+
+// A kind from the header's word, or `None`.
+//
+// ```novo
+// use gitobj
+//
+// fn main() [io]
+//     println("${gitobj.kind_of_word("commit") == Some(GitKindCommit)}")
+// ```
+pub fn kind_of_word(word: Str) -> ?GitObjKind []
+    todo("git-core-nv.gitobj.kind_of_word")
+
+// Do these bytes hash to this id?
+//
+// The integrity check, and the reason `GitOidMismatch` exists: a store
+// that answers the wrong bytes for an id is a disk problem, and a tool
+// that did not check would carry the corruption into whatever it built.
+//
+// ```novo
+// use gitobj
+//
+// fn ok(o: GitOid, payload: Bytes) -> Bool
+//     gitobj.verify(o, GitKindBlob, payload)
+//
+// fn main() [io]
+//     println("whether a store answered the object it was asked for")
+// ```
+pub fn verify(o: GitOid, kind: GitObjKind, payload: Bytes) -> Bool []
+    todo("git-core-nv.gitobj.verify")
+
+// The text a range names, as a string.
+//
+// The one place a span becomes a `Str`, so a caller that walks a tree
+// and wants three of its ten thousand names pays for three.
+//
+// ```novo
+// use gitobj
+//
+// fn name(e: GitTreeEntry, src: Bytes) -> Str
+//     gitobj.span_str(src, e.name_at, e.name_len)
+//
+// fn main() [io]
+//     println("one name out of a tree")
+// ```
+pub fn span_str(src: Bytes, at: Int, len: Int) -> Str []
+    todo("git-core-nv.gitobj.span_str")
+
+// Is this mode one git writes?
+//
+// The five: `040000` a directory, `100644` a file, `100755` an
+// executable, `120000` a symlink, `160000` a submodule commit.  Git
+// also reads `100664`, which it has not written since 2005 and which
+// a repository converted from CVS still contains — accepted here, and
+// `mode_is_canonical` is the narrower question.
+//
+// ```novo
+// use gitobj
+//
+// fn main() [io]
+//     println("${gitobj.mode_is_known(100644)}")
+// ```
+pub fn mode_is_known(mode: Int) -> Bool []
+    todo("git-core-nv.gitobj.mode_is_known")
+
+// Is this a mode git would write today?
+//
+// ```novo
+// use gitobj
+//
+// fn main() [io]
+//     println("${gitobj.mode_is_canonical(100664)}")
+// ```
+pub fn mode_is_canonical(mode: Int) -> Bool []
+    todo("git-core-nv.gitobj.mode_is_canonical")
+
+// Does this mode name a directory?
+//
+// Published because the tree sort rule depends on it and because
+// `mode == 40000` is written wrong half the time — the octal is
+// `040000`, and a decimal literal `40000` is a different number.
+//
+// ```novo
+// use gitobj
+//
+// fn main() [io]
+//     println("${gitobj.mode_is_tree(16384)}")
+// ```
+pub fn mode_is_tree(mode: Int) -> Bool []
+    todo("git-core-nv.gitobj.mode_is_tree")
+
+// Where a loose object sits under `objects/`, as a relative path.
+//
+// The first byte of the id as two hex characters, a slash, and the
+// rest — `objects/4b/f92f3571f7c1e2a...`.  Two characters and not
+// three, and the directory is the FIRST byte rather than the last: a
+// path builder that takes the wrong end produces a store git cannot
+// read and that looks right in a listing.
+//
+// `[]`, because it is arithmetic over an id: the host joins it to the
+// repository directory it already holds, and a caller reading a loose
+// object inflates the file's bytes with flate-nv and hands the result
+// to `unframe`.
+//
+// ```novo
+// use gitobj
+//
+// fn where_it_lives(o: GitOid) -> Str
+//     gitobj.loose_path(o)
+//
+// fn main() [io]
+//     println("where a loose object is stored")
+// ```
+pub fn loose_path(o: GitOid) -> Str []
+    todo("git-core-nv.gitobj.loose_path")

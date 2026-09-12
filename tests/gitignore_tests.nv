@@ -1,0 +1,130 @@
+// gitignore_tests.nv — the grammar that is not a glob, and the blob
+// diff beside it.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-core-nv.<module>.<fn>`.
+//
+// WHERE THE VECTORS CAME FROM.  The pattern pairs below are git's own
+// `t/t0008-ignores.sh` shapes: an anchored pattern against an unanchored
+// one, a negation after an exclusion, and a directory exclusion that
+// prunes the walk.  The binary threshold is git's `buffer_is_binary` —
+// a NUL in the first 8000 bytes and nothing else.
+
+use std.test
+use std.bytes
+use std.list
+use gitignore
+use gitdiff
+use diffscript
+
+@test
+fn test_a_comment_and_a_blank_line_are_not_rules() [io]
+    test.case("a blank line")
+    test.assert_none(gitignore.parse_rule(""))
+
+    test.case("a comment")
+    test.assert_none(gitignore.parse_rule("# build output"))
+
+    test.case("but an escaped hash is a pattern, which a split on # gets wrong")
+    test.assert_some(gitignore.parse_rule("\\#literal"))
+
+    test.case("and an ordinary pattern is one")
+    test.assert_some(gitignore.parse_rule("*.o"))
+
+@test
+fn test_a_slash_anchors_a_pattern_and_its_absence_does_not() [io]
+    // THE PAIR THIS FILE EXISTS FOR.  `build/` matches a directory
+    // called build at ANY depth; `*/build` is anchored to the file's
+    // own directory and matches one level down.  A tool that handed
+    // both to a glob matcher is right about neither.
+    match gitignore.parse_rule("build/")
+        None    => test.assert(false)
+        Some(r) =>
+            test.case("a trailing slash means directories only")
+            test.assert(r.directory_only)
+            test.case("and a trailing slash alone does not anchor")
+            test.assert(r.anchored == false)
+
+    match gitignore.parse_rule("*/build")
+        None    => test.assert(false)
+        Some(r) =>
+            test.case("an interior slash anchors")
+            test.assert(r.anchored)
+            test.case("and says nothing about directories")
+            test.assert(r.directory_only == false)
+
+@test
+fn test_a_bang_re_includes_and_the_order_decides() [io]
+    // The LAST matching rule wins, so a negation before its exclusion
+    // does nothing and a search that stopped at the first match gets
+    // every one of them backwards.
+    match gitignore.parse_rule("!keep.txt")
+        None    => test.assert(false)
+        Some(r) => test.assert(r.negated)
+
+    test.case("an ordinary rule is not negated")
+    match gitignore.parse_rule("*.o")
+        None    => test.assert(false)
+        Some(r) => test.assert(r.negated == false)
+
+@test
+fn test_a_directory_exclusion_stops_the_walk() [io]
+    // `build/` plus `!build/keep.txt` keeps nothing, because git never
+    // descends into an excluded directory and so never reads the
+    // negation.  That is the answer to "why is my file still ignored",
+    // and a boolean cannot give it.
+    match gitignore.parse_rule("build/")
+        None    => test.assert(false)
+        Some(r) => test.assert(gitignore.prunes_directory(r))
+
+    match gitignore.parse_rule("*.o")
+        None    => test.assert(false)
+        Some(r) => test.assert(gitignore.prunes_directory(r) == false)
+
+@test
+fn test_an_empty_stack_ignores_nothing_and_blames_nobody() [io]
+    test.case("no rules, no match")
+    test.assert(gitignore.gitignore_matches([], "build/out.o", false) == false)
+
+    test.case("and no rule to name")
+    test.assert_none(gitignore.gitignore_reason([], "build/out.o", false))
+
+    test.case("an empty file parses to no rules")
+    test.assert_eq(list.len(gitignore.parse_gitignore("", "").rules), 0)
+
+@test
+fn test_a_nul_in_the_first_eight_thousand_bytes_makes_a_blob_binary() [io]
+    // Git's whole test, and the one that decides whether a diff is
+    // hunks or the line "Binary files differ".  A tool that ran a line
+    // diff over a PNG produces megabytes of unreadable output.
+    test.case("text is not binary")
+    test.assert(gitdiff.is_binary(bytes.from_str("hello\n")) == false)
+
+    test.case("a NUL makes it binary")
+    test.assert(gitdiff.is_binary(bytes.from_byte_list([104, 0, 105])))
+
+    test.case("and an empty blob is not")
+    test.assert(gitdiff.is_binary(bytes.zeros(0)) == false)
+
+@test
+fn test_two_identical_blobs_are_one_hundred_per_cent_alike() [io]
+    // The number rename detection compares against a threshold.  A
+    // person argues with this one — "that is not the same file" — so it
+    // is published rather than hidden inside the detector.
+    test.case("identical")
+    test.assert_eq(gitdiff.similarity(bytes.from_str("a\nb\n"), bytes.from_str("a\nb\n")), 100)
+
+    test.case("and two empty blobs are alike as well")
+    test.assert_eq(gitdiff.similarity(bytes.zeros(0), bytes.zeros(0)), 100)
+
+@test
+fn test_the_hunks_are_diff_nv_s_and_nothing_new_is_invented() [io]
+    test.case("two identical blobs produce a script with no changes")
+    let s = gitdiff.diff_blobs(bytes.from_str("a\n"), bytes.from_str("a\n"),
+                               diffscript.default_options())
+    test.assert_eq(list.len(s.ops), 1)
+
+    test.case("and the tokeniser keeps the terminator with its line")
+    let t = gitdiff.tokenise_blobs(bytes.from_str("a\nb\n"), bytes.from_str("a\n"))
+    test.assert_eq(list.len(t.a.spans), 2)
+    test.assert_eq(list.len(t.b.spans), 1)

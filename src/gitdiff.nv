@@ -1,0 +1,110 @@
+// gitdiff.nv — two blobs, compared, and how alike they are.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE DIFF IS diff-nv's, AND ONLY THE TOKENISATION AND THE SIMILARITY
+// ARE HERE.  Tokenising two blobs and answering hunks is
+// `diffscript.diff`; git's own diff is Myers with the same patience and
+// histogram variants diff-nv already publishes, so a second
+// implementation here would be a second thing to keep in step and a
+// second set of hunks a renderer has to learn.  What git adds is
+// deciding that a deleted path and an added path are one renamed file,
+// and that is arithmetic over the scripts rather than a different
+// algorithm.
+//
+// WHY THE BLOB SPLIT IS NOT `str.split`.  Git tokenises by line over
+// BYTES, keeps the line terminator with the line, and treats a file
+// with no trailing newline as a line of its own — so two blobs that
+// differ only in the final newline differ in exactly one hunk, which is
+// what `\ No newline at end of file` in a patch is reporting.  A
+// tokeniser that split on `\n` and dropped the terminator makes that
+// difference invisible and makes the patch it renders unappliable.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use diffscript
+
+// The diff between two blobs, as diff-nv's script.
+//
+// Tokenised by line with git's own whitespace handling.  The hunks a
+// caller renders are `diffscript.hunks`, so a tool that already renders
+// a diff renders this one and nothing new is invented.
+//
+// ```novo
+// use gitdiff
+// use diffscript
+//
+// fn between(a: Bytes, b: Bytes) -> DiffScript
+//     gitdiff.diff_blobs(a, b, diffscript.default_options())
+//
+// fn main() [io]
+//     println("the change between two blobs")
+// ```
+pub fn diff_blobs(a: Bytes, b: Bytes, o: DiffOptions) -> DiffScript []
+    todo("git-core-nv.gitdiff.diff_blobs")
+
+// How alike two blobs are, as the percentage git computes.
+//
+// The number a rename carries and a similarity threshold compares
+// against.  Published because rename detection is the part of a diff a
+// person argues with — "that is not the same file" — and a tool that
+// can show the percentage can be argued with productively.
+//
+// ```novo
+// use gitdiff
+//
+// fn alike(a: Bytes, b: Bytes) -> Int
+//     gitdiff.similarity(a, b)
+//
+// fn main() [io]
+//     println("how alike two blobs are")
+// ```
+pub fn similarity(a: Bytes, b: Bytes) -> Int []
+    todo("git-core-nv.gitdiff.similarity")
+
+// Split two blobs into the lines git diffs them by, interned against
+// each other.
+//
+// BOTH SIDES IN ONE CALL, because diff-nv's token ids only mean "the
+// same token" when the two sides were interned into one table — two
+// `DiffTokens` produced separately have unrelated ids and must not be
+// diffed.  A single-blob tokeniser would publish exactly the value a
+// caller is forbidden to use.
+//
+// The terminator stays with its line and a file with no final newline
+// ends in a line of its own, which is what makes the missing newline a
+// difference a patch can carry.  Published separately from `diff_blobs`
+// so a caller that wants git's tokenisation under diff-nv's other entry
+// points — the three-way merge, a patch applier — can have it.
+//
+// ```novo
+// use gitdiff
+//
+// fn lines(a: Bytes, b: Bytes) -> DiffInput
+//     gitdiff.tokenise_blobs(a, b)
+//
+// fn main() [io]
+//     println("two blobs, as the lines git compares")
+// ```
+pub fn tokenise_blobs(a: Bytes, b: Bytes) -> DiffInput []
+    todo("git-core-nv.gitdiff.tokenise_blobs")
+
+// Would git treat this blob as binary?
+//
+// A NUL byte in the first 8000 is git's whole test, and it is the one
+// that decides whether a diff is hunks or the line "Binary files
+// differ".  Published because a tool that ran a line diff over a PNG
+// produces megabytes of unreadable output, and because the threshold is
+// a constant a reader should be able to see rather than guess.
+//
+// ```novo
+// use gitdiff
+//
+// fn opaque(b: Bytes) -> Bool
+//     gitdiff.is_binary(b)
+//
+// fn main() [io]
+//     println("whether git would call a blob binary")
+// ```
+pub fn is_binary(b: Bytes) -> Bool []
+    todo("git-core-nv.gitdiff.is_binary")

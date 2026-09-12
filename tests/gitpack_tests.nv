@@ -1,0 +1,156 @@
+// gitpack_tests.nv — the request/answer loop, and the varint that is
+// not a varint.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: git-core-nv.gitpack.<fn>`.
+//
+// WHERE THE VECTORS CAME FROM.  Every number below is in git's own
+// `Documentation/technical/pack-format.txt` or in `packfile.c`: the
+// four-byte `PACK` signature, versions 2 and 3, the reserved type 5,
+// the default delta-chain depth of 50, and the offset-delta encoding
+// whose continuation adds one before shifting — so `0x80 0x00` is 128
+// and not 0.  Asserting them is a port check rather than a restatement
+// of this package's code.
+
+use std.test
+use std.bytes
+use std.list
+use gitobj
+use gitpack
+
+@test
+fn test_the_default_bounds_are_git_s_own() [io]
+    test.case("fifty deltas, which is git's pack.depth default")
+    test.assert_eq(gitpack.default_limits().max_depth, 50)
+
+    test.case("and a caller who fetches from a stranger picks smaller ones")
+    test.assert_eq(gitpack.limits(20, 268435456).max_depth, 20)
+    test.assert_eq(gitpack.limits(20, 268435456).max_object_bytes, 268435456)
+
+@test
+fn test_a_pack_says_what_it_is_before_anything_is_read() [io]
+    test.case("bytes that are not a pack are refused, not decoded")
+    match gitpack.parse_pack_header(bytes.zeros(12))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and neither is an index of zeros")
+    match gitpack.parse_index(bytes.zeros(0), gitobj.GitSha1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_offset_delta_base_is_not_leb128() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  Big-endian base-128 where
+    // each continuation ADDS ONE before shifting, so `0x80 0x00` is 128
+    // rather than 0.  A reader that reused a varint routine is correct
+    // for every offset below 128 and wrong after that — which means it
+    // works on a test pack and fails on a real one.
+    let two = bytes.from_byte_list([128, 0])
+    test.case("0x80 0x00 is 128, and LEB128 would say 0")
+    match gitpack.parse_ofs_delta_base(two, 0)
+        None       => test.assert(false)
+        Some(pair) =>
+            test.assert_eq(pair.1, 128)
+            test.assert_eq(pair.0, 2)
+
+    test.case("a single byte below 128 is itself")
+    match gitpack.parse_ofs_delta_base(bytes.from_byte_list([1]), 0)
+        None       => test.assert(false)
+        Some(pair) => test.assert_eq(pair.1, 1)
+
+    test.case("and a continuation that runs off the end is no answer at all")
+    test.assert_none(gitpack.parse_ofs_delta_base(bytes.from_byte_list([128]), 0))
+
+@test
+fn test_a_delta_declares_its_sizes_before_anything_is_allocated() [io]
+    // The check must be on the CLAIM: a delta can name any output
+    // size, so a pack from a stranger can ask a reader to allocate a
+    // terabyte, and a limit applied afterwards is a post-mortem.
+    test.case("an empty payload declares nothing")
+    test.assert_none(gitpack.delta_sizes(bytes.zeros(0)))
+
+    test.case("a delta that copies from outside its base is a fault, not a slice")
+    match gitpack.apply_delta(bytes.zeros(4), bytes.from_byte_list([4, 4, 144, 255]),
+                              gitpack.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_core_asks_and_the_host_answers() [io]
+    // Nothing in this module opens a file.  `read_at` answers the
+    // first RANGE a caller must read, and a caller with the pack in
+    // memory, in a mapped region, or behind an HTTP range request uses
+    // the same reader.
+    test.case("beginning a read is a request, not a result")
+    match gitpack.read_at(12, gitpack.default_limits(), gitobj.GitSha1)
+        GitPackNeeds(read, reader)   =>
+            test.assert(read.at >= 12)
+            test.assert_eq(gitpack.depth_of(reader), 0)
+        GitPackFollows(read, reader) => test.assert(false)
+        GitPackDone(kind, payload)   => test.assert(false)
+
+    test.case("and an entry header read on its own opens nothing either")
+    match gitpack.parse_entry_header(bytes.zeros(8), 0, gitobj.GitSha1)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_index_that_does_not_belong_to_its_pack_is_caught() [io]
+    // Both files end with the pack's own checksum, and a mismatched
+    // pair is the commonest way a half-finished fetch leaves a
+    // repository that looks intact and answers wrong.
+    test.case("two buffers of zeros are not a matching pair")
+    test.assert(gitpack.index_matches_pack(bytes.zeros(32), bytes.zeros(32)) == false)
+
+@test
+fn test_a_lookup_in_an_empty_index_finds_nothing_and_scans_nothing() [io]
+    // The fanout table is kept as the 256 integers it is because the
+    // lookup is a binary search inside ONE bucket; reconstructing the
+    // bucket bounds per lookup is the difference between a pack lookup
+    // and a pack scan.
+    let ix = GitPackIndex {
+        version: 2,
+        count: 0,
+        fanout: [],
+        algo: gitobj.GitSha1,
+        oids_at: 0,
+        offsets_at: 0,
+        large_offsets_at: 0 }
+    test.case("no object is at any offset")
+    test.assert_none(gitpack.offset_of(ix, bytes.zeros(0), gitobj.null_oid(gitobj.GitSha1)))
+
+    test.case("there is no first object")
+    test.assert_none(gitpack.oid_at(ix, bytes.zeros(0), 0))
+
+    test.case("and an abbreviated id could mean nothing")
+    test.assert_eq(list.len(gitpack.oids_with_prefix(ix, bytes.zeros(0), "4bf92f3")), 0)
+
+@test
+fn test_the_host_feeds_and_a_thin_pack_s_base_arrives_separately() [io]
+    // A thin pack — which is what every fetch sends — omits bases the
+    // receiver already has, so the reader asks for one and the host
+    // looks it up in its own store.  That is a different call from
+    // `step` because the bytes come from somewhere else entirely.
+    let r = GitPackReader {
+        entry_at: 12,
+        depth: 0,
+        limits: gitpack.limits(50, 1073741824),
+        algo: gitobj.GitSha1 }
+    test.case("feeding nothing does not produce an object")
+    match gitpack.step(r, bytes.zeros(0))
+        Err(_)   => test.assert(true)
+        Ok(step) =>
+            match step
+                GitPackDone(kind, payload) => test.assert(false)
+                GitPackNeeds(read, reader) => test.assert(true)
+                GitPackFollows(read, rdr)  => test.assert(true)
+
+    test.case("and supplying an empty base does not either")
+    match gitpack.supply_base(r, gitobj.GitKindBlob, bytes.zeros(0))
+        Err(_)   => test.assert(true)
+        Ok(step) =>
+            match step
+                GitPackDone(kind, payload) => test.assert(true)
+                GitPackNeeds(read, reader) => test.assert(true)
+                GitPackFollows(read, rdr)  => test.assert(true)

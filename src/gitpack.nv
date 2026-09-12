@@ -1,0 +1,444 @@
+// gitpack.nv — packfiles, and the delta chain that makes them small.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE CORE ASKS AND THE HOST ANSWERS, WHICH IS THE ONLY SHAPE A PACK
+// READER CAN HAVE.  A packfile is indexed, not streamed: reading one
+// object means seeking to an offset the `.idx` gave you, inflating a
+// header, discovering that the object is a delta against another offset,
+// seeking THERE, and repeating until the chain bottoms out at a base.
+// `docs/publishing.md` § How a `core` package takes bytes from its host
+// calls this the third shape, and it is the right one for the same
+// reason it is right for btree-nv's pages: a reader that streamed the
+// pack would read a gigabyte to answer one object.
+//
+// So `GitPackRead` is a REQUEST — a byte range — and `step` answers
+// either another request or a finished object.  The host does
+// the seeking; nothing here opens a file, and a caller with the pack
+// already in memory, in a mapped region, or behind an HTTP range request
+// uses the same reader.
+//
+// A DELTA CHAIN IS BOUNDED AND THE BOUND IS PUBLISHED.  Git's own limit
+// is 50, and a pack with a longer chain is a pack that will make any
+// reader slow; a pack with a CYCLE is a pack that will make any reader
+// hang, and a crafted one is a denial of service against anything that
+// fetches from a stranger.  `GitPackLimits` carries both and
+// `GitPackCycle` is a fault rather than a loop.
+//
+// THE OFFSET DELTA IS THE ONE NOBODY IMPLEMENTS CORRECTLY.  `OFS_DELTA`
+// stores a NEGATIVE offset from the delta's own header, in a big-endian
+// base-128 encoding where each continuation adds one before shifting —
+// which is not LEB128 and not any other varint, and every reader that
+// reuses a varint routine here is wrong for offsets above 127.
+// `parse_ofs_delta_base` is that encoding on its own, so a test can name
+// it.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// How an object sits in a pack.
+//
+// Four whole kinds and two deltas, which is the pack format's own
+// numbering: 1..4 are commit, tree, blob, tag; 6 is an offset delta and
+// 7 a reference delta.  5 is unused and reserved, and a pack that
+// contains one is corrupt rather than from the future.
+pub enum GitPackKind
+    GitPackWhole(kind: GitObjKind)
+    // A delta against an object earlier in this same pack, named by how
+    // far back it is.
+    GitPackOfsDelta(back: Int)
+    // A delta against an object named by id, which may not be in this
+    // pack at all — a thin pack, which is what a fetch sends.
+    GitPackRefDelta(base: GitOid)
+
+// What a caller must read for the reader to continue.
+//
+// A half-open byte range into the pack.  `len` is a HINT at the header
+// stage — a packed object's compressed length is not in the pack, so the
+// first request for an object asks for a window and the reader asks
+// again if it needed more.  `is_final` says whether the reader expects
+// this to be the last read for the current object.
+pub struct GitPackRead
+    at: Int
+    len: Int
+    is_final: Bool
+
+// The reader's state between requests.
+//
+// A value the caller threads, so a tool reading a hundred objects out of
+// one pack keeps one of these per object and no global state.
+pub struct GitPackReader
+    // The pack offset the current object starts at.
+    entry_at: Int
+    // How many deltas deep the chain currently is.
+    depth: Int
+    limits: GitPackLimits
+    algo: GitHashAlgo
+
+// The two bounds a pack reader needs.
+pub struct GitPackLimits
+    // The longest delta chain to follow.  Git's own default is 50.
+    max_depth: Int
+    // The largest object to reconstruct, in bytes.  A delta can claim
+    // any output size, so a pack from a stranger can ask a reader to
+    // allocate a terabyte — and the check must be on the CLAIM, before
+    // the allocation, which is why it is a limit and not a check
+    // afterwards.
+    max_object_bytes: Int
+
+// What one step of resolution produced.
+//
+// Three arms, and the first is why this type exists rather than a
+// `Result`: "I need these bytes" is neither a success nor a failure, and
+// a reader that could not say it would have to own the file.
+pub enum GitPackStep
+    // Read this range and feed it back.
+    GitPackNeeds(read: GitPackRead, reader: GitPackReader)
+    // The object is reconstructed.
+    GitPackDone(kind: GitObjKind, payload: Bytes)
+    // The chain continues at another offset in this pack.
+    GitPackFollows(read: GitPackRead, reader: GitPackReader)
+
+// Why a pack could not be read.
+pub enum GitPackFault
+    // The four-byte signature is not `PACK`.
+    GitPackBadSignature
+    // A version this reader does not know.  Git has 2 and 3.
+    GitPackBadVersion(found: Int)
+    // Entry type 5, which the format reserves and nothing writes.
+    GitPackReservedType(at: Int)
+    // The chain went past `max_depth`.
+    GitPackTooDeep(at: Int, limit: Int)
+    // An offset delta that points at or after itself, or a ring of
+    // them.  The fault a crafted pack produces and a loop would not
+    // survive.
+    GitPackCycle(at: Int)
+    // A delta whose claimed output size is past `max_object_bytes`.
+    // Reported BEFORE anything is allocated.
+    GitPackTooLarge(at: Int, claimed: Int, limit: Int)
+    // A delta instruction that copies from outside its base.
+    GitPackDeltaOutOfRange(at: Int)
+    // The reconstructed object is not the length the delta header
+    // claimed.
+    GitPackDeltaSizeMismatch(claimed: Int, actual: Int)
+    // A reference delta whose base is not in this pack and was not
+    // supplied.  A thin pack, and the caller has to complete it.
+    GitPackMissingBase(base: Str)
+    // zlib said no.
+    GitPackBadStream(at: Int)
+    // The `.idx` and the `.pack` disagree about the pack's checksum.
+    GitPackIndexMismatch
+    // An `.idx` version this reader does not know.  Git has 1 and 2.
+    GitPackBadIndexVersion(found: Int)
+
+// The standard `Error` implementation.
+impl Error for GitPackFault
+    // One line: what was wrong, and at what offset into the pack.
+    fn message(self) -> Str
+        todo("git-core-nv.gitpack.GitPackFault.message")
+
+// A parsed pack index — the `.idx` beside a `.pack`.
+//
+// The fanout table is kept as the 256 integers it is, because the
+// lookup is a binary search inside one fanout bucket and reconstructing
+// the bucket bounds per lookup is the difference between a pack lookup
+// and a pack scan.
+pub struct GitPackIndex
+    version: Int
+    count: Int
+    fanout: [Int]
+    algo: GitHashAlgo
+    // Ranges into the `.idx` bytes the caller holds, so an index for a
+    // pack with two million objects costs four integers rather than two
+    // million ids.
+    oids_at: Int
+    offsets_at: Int
+    large_offsets_at: Int
+
+// The default bounds: git's own depth of 50, and a gigabyte.
+//
+// ```novo
+// use gitpack
+//
+// fn main() [io]
+//     println("${gitpack.default_limits().max_depth}")
+// ```
+pub fn default_limits() -> GitPackLimits []
+    todo("git-core-nv.gitpack.default_limits")
+
+// Bounds a caller chose.
+//
+// A tool fetching from a stranger wants both smaller than the defaults,
+// and it is one call rather than a note in a README.
+//
+// ```novo
+// use gitpack
+//
+// fn main() [io]
+//     println("${gitpack.limits(20, 268435456).max_depth}")
+// ```
+pub fn limits(max_depth: Int, max_object_bytes: Int) -> GitPackLimits []
+    todo("git-core-nv.gitpack.limits")
+
+// Parse a `.idx`.
+//
+// ```novo
+// use gitpack
+//
+// fn opened(idx: Bytes) -> Result<GitPackIndex, GitPackFault>
+//     gitpack.parse_index(idx, GitSha1)
+//
+// fn main() [io]
+//     println("a pack index, read")
+// ```
+pub fn parse_index(idx: Bytes, algo: GitHashAlgo) -> Result<GitPackIndex, GitPackFault> []
+    todo("git-core-nv.gitpack.parse_index")
+
+// Where in the pack this id lives, or `None`.
+//
+// The binary search inside the fanout bucket.  `None` is an ordinary
+// answer — an object is usually in one of several packs, and a caller
+// asks each in turn.
+//
+// ```novo
+// use gitpack
+//
+// fn at(ix: GitPackIndex, idx: Bytes, o: GitOid) -> Int
+//     match gitpack.offset_of(ix, idx, o)
+//         Some(n) => n
+//         None    => -1
+//
+// fn main() [io]
+//     println("where an object is in a pack")
+// ```
+pub fn offset_of(ix: GitPackIndex, idx: Bytes, o: GitOid) -> ?Int []
+    todo("git-core-nv.gitpack.offset_of")
+
+// The id of the `n`th object in the index, in id order.
+//
+// What a `verify-pack` or a full enumeration walks.
+//
+// ```novo
+// use gitpack
+//
+// fn nth(ix: GitPackIndex, idx: Bytes) -> ?GitOid
+//     gitpack.oid_at(ix, idx, 0)
+//
+// fn main() [io]
+//     println("one object out of a pack index")
+// ```
+pub fn oid_at(ix: GitPackIndex, idx: Bytes, n: Int) -> ?GitOid []
+    todo("git-core-nv.gitpack.oid_at")
+
+// Every id in the index whose hex starts with this prefix.
+//
+// The abbreviated-id lookup, done where the sorted table is rather than
+// by scanning: `git log` shows seven characters and a person types them
+// back, and resolving that is a bucket search plus a walk of the few
+// neighbours.
+//
+// ```novo
+// use gitpack
+//
+// fn matches(ix: GitPackIndex, idx: Bytes) -> [GitOid]
+//     gitpack.oids_with_prefix(ix, idx, "4bf92f3")
+//
+// fn main() [io]
+//     println("the objects an abbreviated id could mean")
+// ```
+pub fn oids_with_prefix(ix: GitPackIndex, idx: Bytes, prefix: Str) -> [GitOid] []
+    todo("git-core-nv.gitpack.oids_with_prefix")
+
+// Begin reading the object at this pack offset.
+//
+// Answers the first range the caller must read.  Nothing is opened and
+// nothing is inflated yet.
+//
+// ```novo
+// use gitpack
+//
+// fn start(at: Int) -> GitPackStep
+//     gitpack.read_at(at, gitpack.default_limits(), GitSha1)
+//
+// fn main() [io]
+//     println("the first read a pack object needs")
+// ```
+pub fn read_at(at: Int, l: GitPackLimits, algo: GitHashAlgo) -> GitPackStep []
+    todo("git-core-nv.gitpack.read_at")
+
+// Feed the bytes the reader asked for, and take the next step.
+//
+// The whole loop a host writes is: `read_at`, then `step` until it
+// answers `GitPackDone`.  Everything in between — inflating, following
+// an offset delta backwards, applying the delta instructions — is here,
+// and the host does nothing but read ranges.
+//
+// ```novo
+// use gitpack
+//
+// fn go(r: GitPackReader, chunk: Bytes) -> Result<GitPackStep, GitPackFault>
+//     gitpack.step(r, chunk)
+//
+// fn main() [io]
+//     println("one step of a pack read")
+// ```
+pub fn step(r: GitPackReader, chunk: Bytes) -> Result<GitPackStep, GitPackFault> []
+    todo("git-core-nv.gitpack.step")
+
+// Feed a reference delta's base, which the pack did not contain.
+//
+// A thin pack — which is what every fetch sends — omits bases the
+// receiver already has, so `step` answers `GitPackMissingBase` and the
+// host looks the base up in its own store and hands it here.  Separate
+// from `step` because the bytes come from somewhere else entirely.
+//
+// ```novo
+// use gitpack
+//
+// fn supply(r: GitPackReader, base: Bytes) -> Result<GitPackStep, GitPackFault>
+//     gitpack.supply_base(r, GitKindBlob, base)
+//
+// fn main() [io]
+//     println("a thin pack's missing base, supplied")
+// ```
+pub fn supply_base(r: GitPackReader, kind: GitObjKind,
+                   base: Bytes) -> Result<GitPackStep, GitPackFault> []
+    todo("git-core-nv.gitpack.supply_base")
+
+// Parse a pack entry's header at this offset.
+//
+// The type and the uncompressed size, published on its own because a
+// tool that only wants to know what is in a pack — `verify-pack`,
+// a size report — reads every header and no payload.
+//
+// ```novo
+// use gitpack
+//
+// fn header(pack: Bytes, at: Int) -> Result<GitPackEntry, GitPackFault>
+//     gitpack.parse_entry_header(pack, at, GitSha1)
+//
+// fn main() [io]
+//     println("what kind of thing is at a pack offset")
+// ```
+pub fn parse_entry_header(pack: Bytes, at: Int,
+                          algo: GitHashAlgo) -> Result<GitPackEntry, GitPackFault> []
+    todo("git-core-nv.gitpack.parse_entry_header")
+
+// One pack entry's header.
+pub struct GitPackEntry
+    kind: GitPackKind
+    // The object's size after inflation and after delta application.
+    // For a delta this is the DELTA's size, not the result's — the
+    // result's size is in the delta payload and `delta_result_size`
+    // reads it.
+    size: Int
+    // Where the zlib stream starts.
+    payload_at: Int
+
+// The negative base offset an `OFS_DELTA` header carries.
+//
+// Published on its own because the encoding is unique to this one place
+// in git and is not LEB128: bytes are big-endian, seven bits each, and
+// each continuation adds one to the accumulated value before shifting,
+// so `0x80 0x00` is 128 rather than 0.  A reader that reused a varint
+// routine is correct for every offset below 128 and wrong after that —
+// which means it works on a test pack and fails on a real one.
+//
+// Answers the number of bytes consumed and the offset.
+//
+// ```novo
+// use gitpack
+//
+// fn base(pack: Bytes, at: Int) -> ?(Int, Int)
+//     gitpack.parse_ofs_delta_base(pack, at)
+//
+// fn main() [io]
+//     println("how far back an offset delta's base is")
+// ```
+pub fn parse_ofs_delta_base(pack: Bytes, at: Int) -> ?(Int, Int) []
+    todo("git-core-nv.gitpack.parse_ofs_delta_base")
+
+// The base and result sizes a delta payload declares.
+//
+// Read BEFORE anything is allocated, which is what makes
+// `max_object_bytes` a bound and not a post-mortem.
+//
+// ```novo
+// use gitpack
+//
+// fn sizes(delta: Bytes) -> ?(Int, Int)
+//     gitpack.delta_sizes(delta)
+//
+// fn main() [io]
+//     println("what a delta claims it will produce")
+// ```
+pub fn delta_sizes(delta: Bytes) -> ?(Int, Int) []
+    todo("git-core-nv.gitpack.delta_sizes")
+
+// Apply a delta to a base.
+//
+// Published separately from `step` because it is the one piece of pack
+// arithmetic with a published test corpus — git's own `t/t5300` fixtures
+// are delta and base pairs — and because a caller reconstructing an
+// object it already has both halves of should not need a reader.
+//
+// ```novo
+// use gitpack
+//
+// fn built(base: Bytes, delta: Bytes) -> Result<Bytes, GitPackFault>
+//     gitpack.apply_delta(base, delta, gitpack.default_limits())
+//
+// fn main() [io]
+//     println("an object, reconstructed from its base")
+// ```
+pub fn apply_delta(base: Bytes, delta: Bytes, l: GitPackLimits) -> Result<Bytes, GitPackFault> []
+    todo("git-core-nv.gitpack.apply_delta")
+
+// The pack header: the version and how many objects it holds.
+//
+// ```novo
+// use gitpack
+//
+// fn header(pack: Bytes) -> Result<(Int, Int), GitPackFault>
+//     gitpack.parse_pack_header(pack)
+//
+// fn main() [io]
+//     println("what a pack says about itself")
+// ```
+pub fn parse_pack_header(pack: Bytes) -> Result<(Int, Int), GitPackFault> []
+    todo("git-core-nv.gitpack.parse_pack_header")
+
+// Does the `.idx` belong to this `.pack`?
+//
+// Both end with the pack's own checksum, and a mismatched pair is the
+// commonest way a half-finished fetch leaves a repository that looks
+// intact and answers wrong.
+//
+// ```novo
+// use gitpack
+//
+// fn ok(pack: Bytes, idx: Bytes) -> Bool
+//     gitpack.index_matches_pack(pack, idx)
+//
+// fn main() [io]
+//     println("whether an index belongs to its pack")
+// ```
+pub fn index_matches_pack(pack: Bytes, idx: Bytes) -> Bool []
+    todo("git-core-nv.gitpack.index_matches_pack")
+
+// How deep the chain under this reader currently is.
+//
+// Published so a tool can report the shape of a pack — a repository
+// whose median chain is 40 is a repository that wants repacking, and
+// that is a fact only a reader can produce.
+//
+// ```novo
+// use gitpack
+//
+// fn deep(r: GitPackReader) -> Int
+//     gitpack.depth_of(r)
+//
+// fn main() [io]
+//     println("how many deltas deep a read has gone")
+// ```
+pub fn depth_of(r: GitPackReader) -> Int []
+    todo("git-core-nv.gitpack.depth_of")

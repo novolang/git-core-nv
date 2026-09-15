@@ -1,266 +1,309 @@
 # git-core-nv
 
-The git format, with nothing that performs: objects, packfiles, refs,
-the index, the ignore grammar and the blob diff — `[]` throughout, so a
-program can read what git wrote without taking a filesystem with it.
+Git stores a project's history as objects named by the hash of their own
+contents, packed into files, pointed at by references, and staged through an
+index. This package reads and writes those formats in novo-lang, and it opens no
+file to do it. The formats are the ones git documents:
+[gitformat-pack](https://git-scm.com/docs/gitformat-pack),
+[gitformat-index](https://git-scm.com/docs/gitformat-index),
+[gitignore](https://git-scm.com/docs/gitignore),
+[git-check-ref-format](https://git-scm.com/docs/git-check-ref-format) and
+[gitrepository-layout](https://git-scm.com/docs/gitrepository-layout).
+[git-nv](https://novo-lang.org/packages/git-nv) is built on this package. It
+adds the filesystem, the working tree and the smart HTTP client.
 
-**Status: NOT IMPLEMENTED — interface only.**  Every `pub fn` body is a
-`todo()`, so the signatures, the effect rows and the tests are published
-and nothing is implemented.  The first implementation is the `0.1.0`
-published over this.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
+its full signature, but every body is a `todo()` that panics when called. The
+package is published so its design can be reviewed and depended on before it is
+implemented. Version 0.1.0 will be the first working release.
 
-## What this is
+## What it is
 
-This is the half [git-nv](https://github.com/novolang/git-nv) named in
-its own README when it was staged: the four modules that declare nothing,
-plus the `[]` functions that were sitting in its working-tree module
-because that is where their consumers were.  git-nv keeps what performs
-— the filesystem, the working tree and the smart HTTP client — and
-depends on this.
+An **object** is the unit git stores. There are four kinds: a **blob** is a
+file's contents, a **tree** is a directory listing, a **commit** is one revision
+of the whole project, and a **tag** is an annotated name for another object. An
+object's **id** is the hash of the string `<kind> <length>\0` followed by the
+object's contents. Computing an id therefore needs nothing but the bytes. Git
+names objects under SHA-1 today and is moving to SHA-256, and the two give
+different ids for the same contents.
 
-| module | holds | rows |
-| --- | --- | --- |
-| `gitobj` | blob, tree, commit, tag; ids under either hash | `[]` |
-| `gitpack` | the pack index, and delta resolution over ranges | `[]` |
-| `gitref` | ref names, loose refs, `packed-refs` | `[]` |
-| `gitindex` | the index file, and the `stat` cache `status` runs on | `[]` |
-| `gitignore` | the `.gitignore` grammar, which is not a glob | `[]` |
-| `gitdiff` | two blobs, compared, over diff-nv | `[]` |
+A **loose object** is one object stored in its own file, compressed with zlib. A
+**packfile** holds many objects in one file, and most of them are stored as
+**deltas**: a set of copy and insert instructions against another object in the
+same pack. Following a delta to the object it is against, and that one to the
+next, is walking a **delta chain**. A packfile is paired with an **index file**,
+the `.idx`, which says at what offset in the pack each id lives.
 
-Six modules, 78 public functions and four trait methods, every body a
-`todo()`.
+A **reference**, or ref, is a name for an object: `refs/heads/main` is a branch,
+`refs/tags/v1.0.0` is a tag. A ref is stored either as its own small file under
+`.git/refs`, called a **loose ref**, or as a line in `.git/packed-refs`. A
+**symbolic ref** names another ref instead of an object, which is what `HEAD` is
+on a branch.
 
-## The load-bearing interface
+The **index** is the file git stages changes in, `.git/index`. It is also a
+cache. Each entry records the `stat` data the filesystem reported for the file
+when it was last hashed, so `git status` can skip files whose size, mode and
+timestamps are unchanged.
 
-```novo norun:pseudo
-pub enum GitPackStep
-    GitPackNeeds(read: GitPackRead, reader: GitPackReader)
-    GitPackDone(kind: GitObjKind, payload: Bytes)
-    GitPackFollows(read: GitPackRead, reader: GitPackReader)
+A **`.gitignore`** file lists patterns for paths git should not track. The
+grammar is not a glob. Order matters, a leading `!` re-includes, and a pattern
+containing a slash means something different from one that does not.
+
+Every function in this package takes the bytes as an argument and returns a
+value. Nothing is read, nothing is written, no clock is consulted and no
+randomness is drawn.
+
+## Install
+
+```
+novo pkg add git-core-nv
 ```
 
-**The core asks and the host answers, and a packfile leaves no other
-choice.**  Reading one object out of a pack means seeking to an offset
-the `.idx` gave you, inflating a header, discovering the object is a
-delta against another offset, seeking there, and repeating until the
-chain bottoms out.  `docs/publishing.md` § How a `core` package takes
-bytes from its host calls this the third shape; it is the right one here
-for the reason it is right for btree-nv's pages — a reader that streamed
-the pack would read a gigabyte to answer one object.
-
-So `GitPackRead` is a byte range, `gitpack.step` answers either another
-range or a finished object, and **nothing in `gitpack` opens a file**.  A
-caller with the pack in memory, in a mapped region, or behind an HTTP
-range request uses the same reader.
-
-`GitPackStep` is an enum and not a `Result` because "I need these bytes"
-is neither a success nor a failure, and a reader that could not say it
-would have to own the file.  It is also what makes this package `core` at
-all: the one surface in git's format that genuinely needs random access
-is the one that asks for it by value.
-
-## The one example that will work
+## Example
 
 ```novo
 use std.bytes
+use std.list
 use gitobj
-
-// The name a blob has in every clone of every repository that ever
-// existed — computed from the bytes, with no store in the room.
-fn name_of(payload: Bytes) -> Str
-    gitobj.oid_hex(gitobj.oid_of(gitobj.GitKindBlob, payload, gitobj.GitSha1))
+use gitref
+use gitignore
 
 fn main() [io]
-    println(name_of(bytes.zeros(0)))
+    // The id of an empty file, computed from its bytes with no store present.
+    let blob = gitobj.oid_of(GitKindBlob, bytes.zeros(0), GitSha1)
+    println(gitobj.oid_hex(blob))
+
+    // Every rule this ref name breaks. An empty list means git would take it.
+    println("${list.len(gitref.check_ref_format("refs/heads/main"))}")
+
+    // One .gitignore file, parsed. The empty string is the directory it governs.
+    let root = gitignore.parse_gitignore("", "build/\n!build/keep.txt\n")
+
+    // Whether git would ignore this path, given the ignore files above it.
+    println("${gitignore.gitignore_matches([root], "build/keep.txt", false)}")
 ```
 
-That prints `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`, which is the id
-git hard-codes for the empty blob.
+The first line prints `e69de29bb2d1d6434b8b29ae775ad8c2e48c5391`, the id git
+gives an empty blob in every repository.
 
-## Adding it, and checking it
+Build and test with `novo pkg build` and `novo test`. Today `novo test` fails on
+purpose: every test reaches a `not implemented` panic.
 
-```console
-$ novo pkg add git-core-nv
-$ novo pkg build
-$ novo test --isolate tests/gitobj_tests.nv
+## What the package contains
+
+| Module | Contents |
+| --- | --- |
+| `gitobj` | Blobs, trees, commits and tags, to and from bytes, and object ids under either hash. |
+| `gitpack` | The pack index, the pack entry headers, and delta resolution as a reader that asks its caller for byte ranges. |
+| `gitref` | Ref names and the rules they must follow, loose refs, `packed-refs`, and resolving a short name to a full one. |
+| `gitindex` | The index file, its `stat` cache, its merge stages and its extensions. |
+| `gitignore` | The `.gitignore` grammar, the match, and which rule decided. |
+| `gitdiff` | Two blobs compared, their similarity as a percentage, and whether git would call a blob binary. |
+
+## How to choose an entry point
+
+**A program that already holds an object's bytes starts at `gitobj`.** Call
+`oid_of` for the id, `unframe` for the kind and payload, and `parse_tree`,
+`parse_commit` or `parse_tag` for the structure.
+
+**A program reading a packfile starts at `gitpack`.** Call `read_at` with the
+pack offset, then `step` with each range of bytes the reader asks for, until it
+answers a finished object. See rule 4 below.
+
+**A program that only wants to know where an object is starts at
+`gitpack.offset_of`.** It searches the `.idx` and reads no pack bytes at all.
+
+**A program building a `status` starts at `gitindex.paths_to_rehash`.** It takes
+the index and one `stat` block per path, and answers only the paths that have to
+be read.
+
+`gitobj.oid_of` and `gitpack.step` need the bytes in hand. `gitpack.parse_index`
+and `gitindex.parse` keep ranges into the buffer you pass and never copy it, so
+that buffer must outlive the parsed value.
+
+## The rules a user needs
+
+1. **An object's id covers a header you must not forget.** The hash is over
+   `<kind> <length>\0` and then the payload. `gitobj.oid_of` prepends it.
+   gitrepository-layout, "Object storage format".
+2. **Tree order is not lexicographic.** A directory compares as though its name
+   ended in `/`, so `foo.txt` sorts before `foo/bar`. A tree in any other order
+   is an object git reads whose id differs from the one git would have written.
+   `gitobj.entries_sorted` is the rule, and `gitobj.serialise_tree` refuses when
+   it does not hold.
+3. **The two hashes are separate namespaces.** `gitobj.oid_eq` answers `false`
+   for a SHA-1 id and a SHA-256 id whatever their bytes. A comparison that
+   ignored the algorithm reports every object missing across a conversion.
+4. **The pack reader asks and the caller answers.** `gitpack.read_at` and
+   `gitpack.step` return a byte range to read. Nothing in `gitpack` opens a
+   file, so a pack in memory, in a mapped region or behind an HTTP range request
+   all work the same way. gitformat-pack, "Pack file format".
+5. **The offset-delta base is not LEB128.** Bytes are big-endian, seven bits
+   each, and each continuation adds one to the accumulated value before
+   shifting. `0x80 0x00` is 128, not 0. A reader that reuses an ordinary varint
+   routine is correct below 128 and wrong above it.
+   `gitpack.parse_ofs_delta_base` is that encoding on its own. gitformat-pack,
+   "Deltified representation".
+6. **A delta declares its output size before anything is allocated.** Set
+   `max_object_bytes` on `GitPackLimits` for any pack from a stranger.
+   `gitpack.delta_sizes` reads the claim, and `GitPackTooLarge` is the refusal.
+7. **A delta chain is bounded at 50 by default, and a cycle is a fault.**
+   `GitPackTooDeep` and `GitPackCycle` are answers, not hangs. That default is
+   git's own `pack.depth`.
+8. **A thin pack is missing its bases.** Every fetch sends one. `step` answers
+   `GitPackMissingBase`, and the caller looks the base up in its own store and
+   hands it to `gitpack.supply_base`. gitformat-pack, "Thin pack".
+9. **A loose ref beats a packed one, and an empty loose file is a deletion.**
+   Git writes an empty loose file as a tombstone over a packed ref. Merging the
+   two sources by concatenation reports a branch at the commit before its last.
+   `gitref.merge_sources` is the rule. gitrepository-layout, "packed-refs".
+10. **A ref name is a file path, and a fetch creates refs from names a stranger
+    chose.** Check every name with `gitref.check_ref_format`, which answers
+    every rule broken rather than the first. git-check-ref-format.
+11. **A short name resolves in a fixed order, and a tag beats a branch.** The
+    order is the name itself, then `refs/`, `refs/tags/`, `refs/heads/`,
+    `refs/remotes/` and `refs/remotes/<name>/HEAD`. `gitref.expand` follows it.
+12. **`HEAD` may resolve to nothing.** A fresh repository names a branch whose
+    file does not exist yet. `gitref.resolve` answers `None`, and a program that
+    assumed `HEAD` always resolves is broken on an empty repository.
+13. **The index is keyed by path and stage together.** Stage 0 is an ordinary
+    file. Stages 1, 2 and 3 are the base, ours and theirs of an unresolved
+    conflict. `gitindex.conflicts` is the query, and a lookup by path alone
+    answers the wrong one of three. gitformat-index, "Index entry".
+14. **A file written in the index's own second must be hashed anyway.** Its
+    mtime cannot distinguish "unchanged" from "changed within the second".
+    `gitindex.is_racy` is that test, and skipping it reports a modified file as
+    clean, once, unreproducibly.
+15. **`needs_rehash` takes the two configuration flags as arguments.** `ctime`
+    is compared only under `core.trustCtime`, and `dev`, `ino`, `uid` and `gid`
+    only under `core.checkStat = default`. A checkout on a network filesystem
+    has all four wrong, and every file would otherwise be reported modified.
+16. **Index version 4 prefix-compresses its paths.** `gitindex.parse` undoes
+    that, so a caller never sees the difference. `gitindex.serialise` writes
+    version 2 unless an entry needs 3, which is git's own rule.
+    gitformat-index, "Extensions".
+17. **A `.gitignore` pattern with no slash matches at any depth, and one with a
+    slash is anchored.** `build/` and `*/build` therefore mean different things.
+    gitignore, "Pattern format".
+18. **The last matching rule in the deepest file wins.** A search that stopped
+    at the first match gets every negation backwards.
+    `gitignore.gitignore_matches` takes the whole stack in root-to-deepest
+    order, and each file carries the directory it governs.
+19. **A directory exclusion prunes the walk.** Git never descends into an
+    excluded directory, so a negation written inside it can re-include nothing.
+    `build/` plus `!build/keep.txt` keeps nothing.
+    `gitignore.prunes_directory` is that rule. gitignore, "Pattern format".
+20. **Git calls a blob binary when a NUL byte appears in its first 8000.** That
+    is the whole test, and it decides whether a diff is hunks or one line.
+    `gitdiff.is_binary`.
+21. **Tokenise both blobs in one call.** `gitdiff.tokenise_blobs` interns the
+    two sides into one table. Token ids from two separate calls are unrelated
+    and must not be compared.
+22. **Ranges point into the buffer you passed.** `GitTreeEntry.name_at`,
+    `GitCommit.message_at` and `GitIndexEntry.path_at` are offsets, not copies.
+    `gitobj.span_str` and `gitindex.path_of` turn one into a string.
+
+## What is not included
+
+- **Anything that opens a file.** Repository discovery, the object store,
+  reading and writing refs and reading the index off disk are
+  [git-nv](https://novo-lang.org/packages/git-nv)'s.
+- **The smart HTTP protocol.** The pkt-line framing and the fetch conversation
+  are git-nv's `gitwire`.
+- **The working tree.** `status`, `staged_changes`, `untracked`, `diff_trees`
+  and `blame` need a filesystem, and they are git-nv's.
+- **Push, merge and rebase.** This package reads and writes the formats. Writing
+  a repository is a larger job than reading one.
+- **`.git/config`.** That is a config file grammar, and
+  [config-core-nv](https://novo-lang.org/packages/config-core-nv) is the package
+  for it. The two settings this package needs, `core.trustCtime` and
+  `core.checkStat`, arrive as arguments.
+- **SHA-1DC.** Git uses a collision-detecting SHA-1 that refuses the known
+  crafted collisions. This package uses plain SHA-1. For every object anyone has
+  committed the two agree. For a crafted collision this package produces an id
+  and git refuses.
+- **Rename detection across a whole diff.** `gitdiff.similarity` is the
+  percentage a rename carries. Pairing added and deleted paths by it is the
+  caller's.
+- **Running on a microcontroller.** `Bytes`, `Str` and `Result` are used
+  throughout, and a packfile is megabytes. There is no device this package is
+  meant for, and it makes no claim.
+
+## Related packages
+
+- [git-nv](https://novo-lang.org/packages/git-nv) is the half that performs.
+  Repository discovery, the object store, the working tree and the smart HTTP
+  client, all built on this package. Every type and function name here is the
+  one git-nv publishes.
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) supplies SHA-1 and
+  SHA-256. An object's id is a hash, so this dependency is not optional.
+- [flate-nv](https://novo-lang.org/packages/flate-nv) supplies zlib. Every loose
+  object is a zlib stream, and so is every packed object's payload.
+- [diff-nv](https://novo-lang.org/packages/diff-nv) supplies the diff itself.
+  `gitdiff.diff_blobs` tokenises two blobs and hands them to `diffscript.diff`,
+  so the hunks a caller renders are diff-nv's.
+- `std.fs` and `std.process` in the standard library are how a program reaches a
+  repository on disk or shells out to `git`. Neither knows anything about the
+  formats this package reads.
+
+## Tests
+
+```bash
+novo test tests                          # every suite
+novo test tests/gitobj_tests.nv          # the ids, and the tree order
+novo test tests/gitpack_tests.nv         # the pack numbers, and the offset delta
+novo test tests/gitref_tests.nv          # the ref-name rules
+novo test tests/gitindex_tests.nv        # the stat cache, and the racy second
+novo test tests/gitignore_tests.nv       # the ignore grammar, and the blob diff
 ```
 
-The suites are **red on purpose**: every body is a `todo()`, so every
-assertion reaches `not implemented: git-core-nv.<module>.<fn>`.  Forty-
-four tests across five suites, all red, every failure that message.
+| Suite | Tests |
+| --- | --- |
+| `gitobj_tests.nv` | 12 |
+| `gitpack_tests.nv` | 8 |
+| `gitref_tests.nv` | 8 |
+| `gitindex_tests.nv` | 8 |
+| `gitignore_tests.nv` | 8 |
 
-`novo pkg add` says `NOT IMPLEMENTED — interface only` on the way in,
-because an interface resolves, downloads and builds exactly like an
-implemented package and the difference only shows the first time
-something calls it.
+`novo test` fails on purpose today. Every assertion reaches a `not implemented:
+git-core-nv.<module>.<fn>` panic, because every body is a `todo()`. The tests
+are the specification the implementation will have to satisfy.
 
-## The layer, and why
+The reference data is git's own. The empty-blob id `e69de29b…` and the empty-tree
+id `4b825dc6…` are the constants `EMPTY_BLOB_SHA1_HEX` and `EMPTY_TREE_SHA1_HEX`
+in git's `hash.c`. The pack numbers are `Documentation/technical/pack-format.txt`
+and `packfile.c`: the `PACK` signature, versions 2 and 3, the reserved type 5,
+the depth of 50, and the offset-delta continuation that adds one before
+shifting. The ref names are the accepted and refused cases of git's
+`t/t1402-check-ref-format.sh`. The index facts are
+`Documentation/technical/index-format.txt` and `read-cache.c`. The ignore pattern
+pairs are the shapes in git's `t/t0008-ignores.sh`, and the binary threshold is
+git's `buffer_is_binary`.
 
-`core`, from the plan — and the line that puts it there is the line
-between **what the format says** and **where the bytes came from**.
+libgit2 is the reference implementation the fixtures are checked against, and
+gitoxide's `gix-object`, `gix-pack`, `gix-ref` and `gix-index` are the crates
+this package's module split follows.
 
-Everything here is arithmetic over bytes the caller already holds.
-Nothing is read, nothing is written, no clock is consulted and no
-randomness is drawn.  That is what a registry verifying a tag's commit
-wants, and a build cache keyed by a tree id, and a signer that reads a
-commit's bytes and never touches a work tree — three consumers that
-today would have to take a filesystem to get a hash.
+## Implementation status
 
-The three dependencies are all `core` too, which is what lets this
-package be `core` at all: a dependency's layer may not be wider than its
-consumer's.
+| Item | Implemented |
+| --- | --- |
+| `gitobj`'s eight types, from `GitHashAlgo` to `GitFramed`, and `impl Error for GitObjFault` | declared |
+| `gitobj`'s 24 functions, from `oid_of` to `loose_path` | no |
+| `gitpack`'s eight types, from `GitPackKind` to `GitPackEntry`, and `impl Error for GitPackFault` | declared |
+| `gitpack`'s 16 functions, from `default_limits` to `depth_of` | no |
+| `gitref`'s four types, from `GitRefTarget` to `GitPackedRefs`, and `impl Error for GitRefNameFault` | declared |
+| `gitref`'s 15 functions, from `check_ref_format` to `head_name` | no |
+| `gitindex`'s six types, from `GitStat` to `GitTreeLevel`, and `impl Error for GitIndexFault` | declared |
+| `gitindex`'s 14 functions, from `parse` to `paths_to_rehash` | no |
+| `gitignore`'s three types, from `GitIgnoreFile` to `GitIgnoreMatch` | declared |
+| `gitignore`'s five functions, from `parse_gitignore` to `parse_rule` | no |
+| `gitdiff`'s four functions: `diff_blobs`, `similarity`, `tokenise_blobs`, `is_binary` | no |
 
-**No device claim.**  `Bytes`, `Str` and `Result` are throughout and a
-packfile is megabytes; a microcontroller has no use for either.  There is
-no `tests/embedded_probe.nv`, and the audit's `core-embedded` row passes
-on a package that makes no claim.
-
-## What moved out of git-nv, and what stayed
-
-| git-nv 0.0.1 | git-core-nv 0.0.1 | why |
-| --- | --- | --- |
-| `gitobj` (whole module) | `gitobj` | the object model; every row already `[]` |
-| `gitpack` (whole module) | `gitpack` | the pack reader asks for ranges; it opens nothing |
-| `gitref` (whole module) | `gitref` | the ref grammar and `packed-refs` are text |
-| `gitindex` (whole module) | `gitindex` | the index file format and its `stat` cache |
-| `gitwork.parse_gitignore` | `gitignore.parse_gitignore` | the grammar, with its own module |
-| `gitwork.gitignore_matches` | `gitignore.gitignore_matches` | — |
-| `gitwork.gitignore_reason` | `gitignore.gitignore_reason` | — |
-| `gitwork.diff_blobs` | `gitdiff.diff_blobs` | the diff-nv boundary, with its own module |
-| `gitwork.similarity` | `gitdiff.similarity` | — |
-| `gitwork.paths_to_rehash` | `gitindex.paths_to_rehash` | it is the batch form of `needs_rehash`, and it belongs beside it |
-
-**Every public type and every function keeps the name git-nv published**,
-so nothing downstream renames.  Three module paths change, because the
-six `[]` functions that lived in `gitwork` needed somewhere to live that
-was not a working-tree module: `gitwork.parse_gitignore` is
-`gitignore.parse_gitignore`, `gitwork.diff_blobs` is
-`gitdiff.diff_blobs`, and `gitwork.paths_to_rehash` is
-`gitindex.paths_to_rehash`.  No consumer holds any of them today — git-nv
-is an interface release and nothing calls it yet.
-
-**What stayed in git-nv**: `gitrepo` (discovery, the object store, refs
-and history — `[fs]` throughout), `gitwire` (the smart HTTP read half),
-and the rest of `gitwork` — `status`, `staged_changes`, `is_clean`,
-`untracked`, `diff_trees` and `blame`, all `[fs]`.
-
-**git-nv's manifest change at its next version** is one line in
-`[dependencies]`:
-
-```toml
-git-core-nv = "^0.0.1"
-```
-
-and four `src/*.nv` files deleted.  Its `layer` stays `host`, because
-what is left of it reads the disk and talks to a server.
-
-### What did not move, and why
-
-`default_rename_options`, `change_code` and `porcelain_line` are `[]`
-today and did NOT move, and the third is the interesting one.  All three
-take or return `GitRenameOptions`, `GitChange` and `GitStatusEntry` —
-types that only a `[fs]` function can produce.  A `core` package that
-declared a type nothing in it can construct would be publishing a shape
-whose only purpose is to serve the half that stayed behind; the ignore
-rules and the `stat` blocks are different, because `parse_gitignore` and
-`stat_of` build theirs from a caller's own bytes and numbers.  That is the
-test this split used, and it is the one the milestone review should argue
-with if it disagrees.
-
-`gitwire`'s pkt-line codec — `pkt_line`, `flush_pkt`, `delim_pkt`,
-`read_pkt`, `sideband_of` and the three URL builders — is `[]` as well and
-also stayed, because the plan row puts the smart HTTP client in the host
-half and a framing layer with one caller is not a package boundary.  If a
-second consumer appears (a git server, a proxy, a bundle reader), those
-eight functions are the next thing to move and they move without a
-signature change.
-
-## Five places the format bites, and where each one is
-
-Every item here is a rule a hand-written git tool gets wrong, and each is
-published as its own function so a test can name it:
-
-- **Tree order is not lexicographic.**  A directory sorts as though its
-  name ended in `/`, so `foo.txt` comes before `foo/bar`.  A tree in the
-  wrong order is an object git reads and whose id differs from what git
-  would have written — `gitobj.entries_sorted`.
-- **The offset-delta base is not LEB128.**  Big-endian base-128 where
-  each continuation adds one before shifting, so `0x80 0x00` is 128
-  rather than 0.  A reader that reused a varint routine works on a test
-  pack and fails on a real one — `gitpack.parse_ofs_delta_base`.
-- **A loose ref beats a packed one, and an empty loose file is a
-  deletion.**  A reader that concatenated the two sources reports a
-  branch at the commit before its last — `gitref.merge_sources`.
-- **A ref name is a file path.**  `..` in one walks out of the
-  repository, and a fetch creates refs from names a remote chose —
-  `gitref.check_ref_format`, answering every rule broken rather than the
-  first.
-- **The index is a `stat` cache and `status` runs on it.**  A model
-  without the `stat` block produces a `status` that is correct and forty
-  times slower; the racy-clean rule is why an entry written in the
-  index's own second must be hashed anyway — `gitindex.needs_rehash` and
-  `gitindex.is_racy`.
-
-And a sixth this package adds, because the split gave it a home:
-**`.gitignore` is not a glob.**  A pattern with no `/` matches at any
-depth, one with a `/` is anchored, and a directory exclusion prunes the
-walk so a negation inside it can never re-include anything —
-`gitignore.prunes_directory` is that last rule, and it is the answer to
-"why is my file still ignored".
-
-## The three dependencies
-
-**crypto-nv**, and it is not optional: an object's id is the hash of its
-bytes, and this package has both of git's — SHA-1 for the format git has
-and SHA-256 for the one it is moving to.  That is why the hash is a
-parameter on every call that makes an id rather than a constant, and why
-`GitOid` carries which algorithm made it: comparing ids across a
-conversion is then a type-level mistake rather than a silent "object
-missing".
-
-The SHA-1 is the **plain** one, not the collision-detecting SHA-1DC git
-itself now uses.  For every object anybody has committed the two agree;
-for the handful of crafted collisions this package would hash them and
-git would refuse.
-
-**flate-nv**, because every loose object is a zlib stream and so is every
-packed object's payload.  `inflate.feed` is exactly the feed-and-drain
-shape a pack reader over a caller's bytes needs — no file, no allocation
-the caller did not ask for.
-
-**diff-nv**, because git's own diff is Myers with the same patience and
-histogram variants diff-nv already publishes.  `gitdiff.diff_blobs`
-tokenises two blobs and hands them to `diffscript.diff`; the hunks a
-caller renders are diff-nv's, so a tool that already renders a diff
-renders this one.  The one thing git adds — rename detection by
-similarity — is arithmetic over the scripts rather than a different
-algorithm, and `gitdiff.similarity` is that number on its own.
-
-## What is deliberately absent
-
-- **Anything that opens a file.**  Discovery, the object store, writing
-  refs and reading the index off disk are git-nv's, and that is the whole
-  point of the split.
-- **The smart HTTP protocol.**  git-nv's `gitwire`, for the same reason.
-- **Push, merge, rebase.**  Reading a repository and writing one are
-  different amounts of work, and git-nv is the reading half; this is the
-  format under it.
-- **`.git/config`.**  That is config-nv's grammar, and the flags this
-  package needs — `core.trustCtime`, `core.checkStat` — arrive as
-  arguments, which is what keeps `needs_rehash` testable.
-- **SHA-1DC**, as above.
-
-## Reference
-
-gitoxide's `gix-object`, `gix-pack`, `gix-ref` and `gix-index` are the
-ports this package's module split follows; libgit2 is the reference
-implementation and its test fixtures are the oracle; git's own
-`Documentation/technical/` — the pack format, the index format — is the
-specification the module headers transcribe.  The vectors in `tests/` are
-git's own constants and its own `t/` cases, retyped: the empty-blob and
-empty-tree ids from `hash.c`, the ref-name rules from
-`t1402-check-ref-format`, the ignore pairs from `t0008-ignores`.
+78 public functions and four `Error` implementations, every body a `todo()`.
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

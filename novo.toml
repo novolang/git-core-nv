@@ -1,7 +1,7 @@
 [package]
 name        = "git-core-nv"
 license     = "Apache-2.0"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The git object format with no filesystem: blobs, trees, commits and tags to and from bytes under SHA-1 or SHA-256, a packfile reader that asks its caller for byte ranges and resolves delta chains, the reference grammar and packed-refs, the index file with its stat cache, the ignore grammar and the blob diff.  Interface only — every body is a todo()."
 
 # `license` sits immediately after the name, before any value that could

@@ -10,9 +10,9 @@ hash = "b0bf3b342541097171db05e4fb7e0000b023bee24040eb5476398beeb9176d35"
 [diff-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "84e95079d56414d0c9aa3add54389f366247c50d2e6aa1cebec84dd702d83599"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "e1728b7b518b46ccaab11c6a9e3438bb8ddf881539fc08c9c4541d269fe39a57"
 
 [flate-nv]
 source = "registry"
@@ -24,6 +24,6 @@ hash = "94526969eb11b1c539e1eaad561a1036c127902eb4d4c467f9c12fc098e4790c"
 [unicode-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "e72dc94d06a8697b2c1451d058f53579777b9c5e5c43559e0b8ec3d1ab50d9b8"
+req = "^0.1.3"
+version = "0.1.3"
+hash = "bb136fc5a87b6306b006781512a2b65ec4b0d8b86d4016ba7d94ee089ea2c120"
